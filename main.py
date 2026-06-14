@@ -11,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8971446928:AAHU-Lx9cZrKFZg68byAxiZT2zy9artzpR4"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8971446928:AAHU-Lx9cZrKFZg68byAxiZT2zy9artzpR4")
 SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
 CITIES_FILE = "cities.json"
@@ -42,7 +42,20 @@ def save_cities(cities: dict):
 
 # ==================== GOOGLE SHEETS ====================
 def get_sheet_data():
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+    import base64
+    import tempfile
+
+    google_creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_B64")
+    if google_creds_b64:
+        # Railway — читаем из переменной окружения
+        creds_json = base64.b64decode(google_creds_b64).decode("utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(creds_json)
+            temp_path = f.name
+        creds = Credentials.from_service_account_file(temp_path, scopes=SCOPES)
+    else:
+        # Локально — читаем из файла
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
 
