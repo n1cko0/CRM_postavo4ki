@@ -42,11 +42,17 @@ def save_cities(cities: dict):
 
 # ==================== GOOGLE SHEETS ====================
 def get_sheet_data():
+    import base64
     import json as json_module
 
+    google_creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_B64")
     google_creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
-    if google_creds_json:
+    if google_creds_b64:
+        creds_json_str = base64.b64decode(google_creds_b64).decode("utf-8")
+        creds_dict = json_module.loads(creds_json_str)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    elif google_creds_json:
         creds_dict = json_module.loads(google_creds_json)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     else:
