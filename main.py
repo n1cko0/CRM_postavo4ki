@@ -54,6 +54,9 @@ def get_sheet_data():
         creds_dict = json_module.loads(creds_json_str)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     elif google_creds_json:
+        # Заменяем реальные переносы строк на \n для валидного JSON
+        import re as re_module
+        google_creds_json = re_module.sub(r'(?<!\\)\n', '\\n', google_creds_json)
         creds_dict = json_module.loads(google_creds_json)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     else:
