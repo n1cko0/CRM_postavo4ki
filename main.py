@@ -50,9 +50,11 @@ def get_sheet_data():
 
     if google_creds_b64:
         creds_json_str = base64.b64decode(google_creds_b64).decode("utf-8")
+        creds_json_str = creds_json_str.replace('\\n', '\n')
         creds_dict = json_module.loads(creds_json_str)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     elif google_creds_json:
+        google_creds_json = google_creds_json.replace('\\n', '\n')
         creds_dict = json_module.loads(google_creds_json)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     else:
