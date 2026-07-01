@@ -15,6 +15,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8971446928:AAF32e4fMvi9KQkcFKK924K1Qbxw
 SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
 CITIES_FILE = "cities.json"
+ALLOWED_USERS = [7305470549, 506094120]
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -219,7 +220,6 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
                 msg += f"👷 Вантажників: {first['workers']}\n"
                 if first['phone']:
                     msg += f"📞 {first['phone']}"
-
             else:
                 group = [p for p in group if p['city'].lower() in my_cities]
                 if not group:
@@ -240,7 +240,6 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
                     msg += f"👷 Вантажників: {first['workers']}\n"
                     if first['phone']:
                         msg += f"📞 {first['phone']}"
-
                 elif len(group) == 1:
                     msg = f"📦 *{first['brand']}*\n"
                     msg += f"📍 {first['city']}, {first['tc']}\n"
@@ -252,7 +251,6 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
                     msg += f"👷 Вантажників: {first['workers']}\n"
                     if first['phone']:
                         msg += f"📞 {first['phone']}"
-
                 else:
                     msg = f"🗺 Маршрут\n"
                     msg += f"👷 Вантажників: {first['workers']}\n"
@@ -297,7 +295,6 @@ def get_deliveries_keyboard():
         ],
         resize_keyboard=True
     )
-
 
 
 # ==================== ВІДПРАВКА ПОСТАВОК ====================
@@ -371,12 +368,17 @@ async def send_deliveries_query(query, filter_date: date = None):
 
 # ==================== КОМАНДИ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        await update.message.reply_text("⛔ Доступ заборонено.")
+        return
     await update.message.reply_text(
         "👋 Привіт! Я бот для поставок FM Logistics.\n\nОбери розділ:",
         reply_markup=get_main_keyboard()
     )
 
 async def mycities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
     cities = load_cities()
     if not cities:
         await update.message.reply_text("❌ Список міст порожній.")
@@ -388,6 +390,8 @@ async def mycities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def addcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
     if len(context.args) < 2:
         await update.message.reply_text("Використання: /addcity Назва 135\nПриклад: /addcity Вінниця 135")
         return
@@ -404,6 +408,8 @@ async def addcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Додано: {city_name} — {rate} грн/год")
 
 async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
     if not context.args:
         await update.message.reply_text("Використання: /removecity Назва\nПриклад: /removecity Вінниця")
         return
@@ -417,8 +423,10 @@ async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Місто '{city_name}' не знайдено.")
 
 
-# ==================== TEXT HANDLER (Reply кнопки) ====================
+# ==================== TEXT HANDLER ====================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
     text = update.message.text
 
     if text == "📦 Поставки":
@@ -451,9 +459,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await mycities(update, context)
 
 
-# ==================== CALLBACK HANDLER (Inline кнопки) ====================
+# ==================== CALLBACK HANDLER ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.from_user.id not in ALLOWED_USERS:
+        await query.answer("⛔ Доступ заборонено.")
+        return
     await query.answer()
     data = query.data
 
