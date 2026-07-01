@@ -54,20 +54,7 @@ def get_sheet_data():
         creds_dict = json_module.loads(creds_json_str)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     elif google_creds_json:
-        # Экранируем все управляющие символы кроме уже экранированных
-        cleaned = ''
-        for char in google_creds_json:
-            if ord(char) < 32 and char not in '\n\r\t':
-                pass
-            elif char == '\n':
-                cleaned += '\\n'
-            elif char == '\r':
-                cleaned += '\\r'
-            elif char == '\t':
-                cleaned += '\\t'
-            else:
-                cleaned += char
-        creds_dict = json_module.loads(cleaned)
+        creds_dict = json_module.loads(google_creds_json, strict=False)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     else:
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
