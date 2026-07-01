@@ -11,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8971446928:AAHU-Lx9cZrKFZg68byAxiZT2zy9artzpR4")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8971446928:AAF32e4fMvi9KQkcFKK924K1QbxwMbtNzzs")
 SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
 CITIES_FILE = "cities.json"
