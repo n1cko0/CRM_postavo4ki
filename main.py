@@ -491,9 +491,9 @@ async def send_deliveries_query(query, filter_date: date = None):
 # ==================== КОМАНДИ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
-        await update.message.reply_text(f"⛔ Доступ заборонено. Ваш ID: {update.effective_user.id}")
+        await update.message.reply_text("⛔ Доступ заборонено.")
         return
-    await update.message.reply_text(f"👋 Привіт! Ваш ID: {update.effective_user.id}")
+    await update.message.reply_text(
         "👋 Привіт! Я бот для поставок FM Logistics.\n\nОбери розділ:",
         reply_markup=get_main_keyboard()
     )
@@ -551,6 +551,8 @@ async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== TEXT HANDLER ====================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
+        return
+    if update.message.chat.type in ['group', 'supergroup']:
         return
 
     user_id = update.effective_user.id
