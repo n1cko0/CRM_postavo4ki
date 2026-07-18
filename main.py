@@ -491,9 +491,9 @@ async def send_deliveries_query(query, filter_date: date = None):
 # ==================== КОМАНДИ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
-        await update.message.reply_text("⛔ Доступ заборонено.")
+        await update.message.reply_text(f"⛔ Доступ заборонено. Ваш ID: {update.effective_user.id}")
         return
-    await update.message.reply_text(
+    await update.message.reply_text(f"👋 Привіт! Ваш ID: {update.effective_user.id}")
         "👋 Привіт! Я бот для поставок FM Logistics.\n\nОбери розділ:",
         reply_markup=get_main_keyboard()
     )
