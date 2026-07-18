@@ -16,6 +16,7 @@ SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
 CITIES_FILE = "cities.json"
 ALLOWED_USERS = [7305470549, 506094120]
+REPORT_GROUP_ID = -5344273524
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -28,6 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Хранилище сообщений об оплатах
+payment_sessions = {}
+current_report_date = {}
+
 
 # ==================== МІСТА ====================
 def load_cities() -> dict:
@@ -35,6 +40,7 @@ def load_cities() -> dict:
         with open(CITIES_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
+
 
 def save_cities(cities: dict):
     with open(CITIES_FILE, "w", encoding="utf-8") as f:
@@ -62,7 +68,6 @@ def get_sheet_data():
 
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
-
     last_sheet = spreadsheet.worksheets()[-1]
     logger.info(f"Читаємо лист: {last_sheet.title}")
 
@@ -177,16 +182,10 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
             is_continuation = is_merged_with_above(row_idx, 5, merged_cells)
 
             point = {
-                "city": city,
-                "tc": tc,
-                "brand": brand,
-                "boxes": boxes,
-                "workers": workers_cell,
-                "date": parsed_date,
-                "date_str": delivery_date,
-                "time": delivery_time,
-                "phone": driver_phone,
-                "is_continuation": is_continuation,
+                "city": city, "tc": tc, "brand": brand, "boxes": boxes,
+                "workers": workers_cell, "date": parsed_date,
+                "date_str": delivery_date, "time": delivery_time,
+                "phone": driver_phone, "is_continuation": is_continuation,
             }
 
             if is_continuation:
@@ -263,8 +262,7 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
                         msg += f"📅 {p['date_str']}"
                         if p['time']:
                             msg += f"  🕐 {p['time']}"
-                        msg += f"  📦 {p['boxes']} кор.\n"
-                        msg += "\n"
+                        msg += f"  📦 {p['boxes']} кор.\n\n"
 
             messages.append({
                 "text": msg,
@@ -275,15 +273,139 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
     return messages
 
 
-# ==================== REPLY KEYBOARD ====================
+# ==================== ЗВІТ ====================
+def parse_payment_message(text: str):
+    pattern = r'^(.+?)\s+по\s+(\d+(?:[.,]\d+)?)\s+\((\d+(?:[.,]\d+)?)\)'
+    match = re.match(pattern, text.strip())
+    if not match:
+        return None
+    location = match.group(1).strip()
+    amount_per_person = float(match.group(2).replace(',', '.'))
+    hours = float(match.group(3).replace(',', '.'))
+    return {
+        'location': location,
+        'amount_per_person': amount_per_person,
+        'hours': hours,
+    }
+
+
+def parse_workers_count(text: str):
+    mapping = {
+        'за двох': 2, 'за трьох': 3, 'за чотирьох': 4,
+        "за п'ятьох": 5, 'за шістьох': 6,
+    }
+    return mapping.get(text.strip().lower())
+
+
+def is_card_number(text: str) -> bool:
+    cleaned = re.sub(r'[\s\-]', '', text.strip().lstrip('*').strip())
+    return cleaned.isdigit() and len(cleaned) >= 12
+
+
+def build_report(report_date: str) -> list:
+    messages = payment_sessions.get(report_date, [])
+    if not messages:
+        return []
+
+    cities = load_cities()
+    reports = []
+    workers_ua = {
+        1: '', 2: 'За двох', 3: 'За трьох',
+        4: 'За чотирьох', 5: "За п'ятьох", 6: 'За шістьох'
+    }
+
+    i = 0
+    while i < len(messages):
+        text = messages[i]['text'].strip()
+        payment = parse_payment_message(text)
+        if not payment:
+            i += 1
+            continue
+
+        location = payment['location']
+        hours = payment['hours']
+
+        city = None
+        for city_name in cities.keys():
+            if location.lower().startswith(city_name.lower()):
+                city = city_name
+                break
+
+        my_rate = cities.get(city, 0) if city else 0
+
+        workers_count = 0
+        j = i + 1
+
+        if j < len(messages):
+            next_text = messages[j]['text'].strip()
+            wc = parse_workers_count(next_text)
+            if wc:
+                workers_count = wc
+                j += 1
+                while j < len(messages) and is_card_number(messages[j]['text']):
+                    j += 1
+            else:
+                while j < len(messages) and is_card_number(messages[j]['text']):
+                    workers_count += 1
+                    j += 1
+
+        if workers_count == 0:
+            workers_count = 1
+
+        my_total = my_rate * hours * workers_count
+
+        if workers_count > 1:
+            per_person = int(my_total / workers_count)
+            label = workers_ua.get(workers_count, f'За {workers_count}')
+            report_text = f"{location} по {per_person} ({hours})\n{label}"
+        else:
+            report_text = f"{location} по {int(my_total)} ({hours})"
+
+        reports.append(report_text)
+        i = j
+
+    return reports
+
+
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.chat.id != REPORT_GROUP_ID:
+        return
+    if msg.from_user.id not in ALLOWED_USERS:
+        return
+
+    text = msg.text or ""
+    if not text:
+        return
+
+    user_id = msg.from_user.id
+    if user_id not in current_report_date:
+        return
+
+    report_date = current_report_date[user_id]
+    if report_date == "waiting_date":
+        return
+
+    if report_date not in payment_sessions:
+        payment_sessions[report_date] = []
+
+    payment_sessions[report_date].append({
+        'text': text,
+        'timestamp': msg.date.isoformat(),
+        'message_id': msg.message_id,
+    })
+
+
+# ==================== KEYBOARDS ====================
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             ["📦 Поставки"],
-            ["🏙 Мої міста"],
+            ["🏙 Мої міста", "📊 Звіт"],
         ],
         resize_keyboard=True
     )
+
 
 def get_deliveries_keyboard():
     return ReplyKeyboardMarkup(
@@ -376,6 +498,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_keyboard()
     )
 
+
 async def mycities(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
@@ -388,6 +511,7 @@ async def mycities(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"📍 {city} — {rate} грн/год\n"
     text += "\nЩоб додати: /addcity Назва Тариф\nЩоб видалити: /removecity Назва"
     await update.message.reply_text(text, parse_mode="Markdown")
+
 
 async def addcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
@@ -406,6 +530,7 @@ async def addcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cities[city_name] = rate
     save_cities(cities)
     await update.message.reply_text(f"✅ Додано: {city_name} — {rate} грн/год")
+
 
 async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
@@ -427,6 +552,25 @@ async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
+
+    user_id = update.effective_user.id
+
+    # Обработка ввода даты вручную
+    if current_report_date.get(user_id) == "waiting_date":
+        text_input = update.message.text.strip()
+        try:
+            datetime.strptime(text_input, "%d.%m.%Y")
+            current_report_date[user_id] = text_input
+            if text_input not in payment_sessions:
+                payment_sessions[text_input] = []
+            await update.message.reply_text(
+                f"✅ Дата звіту: {text_input}\n\nТепер скидайте оплати в групу.",
+                reply_markup=get_main_keyboard()
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Невірний формат. Введіть дату як ДД.ММ.РРРР")
+        return
+
     text = update.message.text
 
     if text == "📦 Поставки":
@@ -457,6 +601,16 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif text == "🏙 Мої міста":
         await mycities(update, context)
+    elif text == "📊 Звіт":
+        keyboard = [
+            [InlineKeyboardButton("📅 Вчора", callback_data="report_yesterday")],
+            [InlineKeyboardButton("📅 Сьогодні", callback_data="report_today")],
+            [InlineKeyboardButton("✏️ Ввести дату", callback_data="report_custom")],
+        ]
+        await update.message.reply_text(
+            "Оберіть дату звіту:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 
 # ==================== CALLBACK HANDLER ====================
@@ -476,6 +630,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await query.edit_message_text("Помилка дати")
 
+    elif data == "report_yesterday":
+        d = (date.today() - timedelta(days=1)).strftime("%d.%m.%Y")
+        current_report_date[query.from_user.id] = d
+        if d not in payment_sessions:
+            payment_sessions[d] = []
+        keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
+        await query.edit_message_text(
+            f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "report_today":
+        d = date.today().strftime("%d.%m.%Y")
+        current_report_date[query.from_user.id] = d
+        if d not in payment_sessions:
+            payment_sessions[d] = []
+        keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
+        await query.edit_message_text(
+            f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "report_custom":
+        current_report_date[query.from_user.id] = "waiting_date"
+        await query.edit_message_text("Введіть дату у форматі ДД.ММ.РРРР:")
+
+    elif data == "build_report":
+        user_id = query.from_user.id
+        if user_id not in current_report_date:
+            await query.edit_message_text("❌ Спочатку оберіть дату звіту.")
+            return
+        report_date = current_report_date[user_id]
+        reports = build_report(report_date)
+        if not reports:
+            await query.edit_message_text("❌ Немає даних для звіту.")
+            return
+        await query.edit_message_text(f"✅ Звіт за {report_date}:")
+        for r in reports:
+            await query.message.reply_text(r)
+
 
 # ==================== MAIN ====================
 def main():
@@ -484,6 +678,10 @@ def main():
     app.add_handler(CommandHandler("mycities", mycities))
     app.add_handler(CommandHandler("addcity", addcity))
     app.add_handler(CommandHandler("removecity", removecity))
+    app.add_handler(MessageHandler(
+        filters.Chat(REPORT_GROUP_ID) & filters.TEXT & ~filters.COMMAND,
+        group_message_handler
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_handler(CallbackQueryHandler(button_handler))
     logger.info("Бот запущено!")
