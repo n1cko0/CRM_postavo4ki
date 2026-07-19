@@ -29,7 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Хранилище сообщений об оплатах
 payment_sessions = {}
 current_report_date = {}
 
@@ -308,61 +307,81 @@ def build_report(report_date: str) -> list:
         return []
 
     cities = load_cities()
-    reports = []
     workers_ua = {
         1: '', 2: 'За двох', 3: 'За трьох',
         4: 'За чотирьох', 5: "За п'ятьох", 6: 'За шістьох'
     }
 
-    i = 0
-    while i < len(messages):
-        text = messages[i]['text'].strip()
+    # Группируем сообщения по блокам
+    blocks = []
+    current_block = None
+
+    for msg in messages:
+        text = msg['text'].strip()
         payment = parse_payment_message(text)
-        if not payment:
-            i += 1
-            continue
 
-        location = payment['location']
-        hours = payment['hours']
+        if payment:
+            if current_block:
+                blocks.append(current_block)
+            current_block = {
+                'location': payment['location'],
+                'hours': payment['hours'],
+                'za_kilkokh': 0,
+                'cards_count': 0,
+            }
+        elif current_block:
+            wc = parse_workers_count(text)
+            if wc:
+                current_block['za_kilkokh'] += wc
+            elif is_card_number(text):
+                current_block['cards_count'] += 1
 
+    if current_block:
+        blocks.append(current_block)
+
+    # Группируем блоки по локации
+    grouped = {}
+    grouped_order = []
+    for block in blocks:
+        loc = block['location']
+        if loc not in grouped:
+            grouped[loc] = {
+                'location': loc,
+                'hours': block['hours'],
+                'total_workers': 0,
+            }
+            grouped_order.append(loc)
+
+        if block['za_kilkokh'] > 0:
+            grouped[loc]['total_workers'] += block['za_kilkokh']
+        elif block['cards_count'] > 0:
+            grouped[loc]['total_workers'] += block['cards_count']
+        else:
+            grouped[loc]['total_workers'] += 1
+
+    # Формируем отчёт
+    reports = []
+    for loc in grouped_order:
+        data = grouped[loc]
         city = None
         for city_name in cities.keys():
-            if location.lower().startswith(city_name.lower()):
+            if data['location'].lower().startswith(city_name.lower()):
                 city = city_name
                 break
 
         my_rate = cities.get(city, 0) if city else 0
+        hours = data['hours']
+        total_workers = data['total_workers']
+        my_total = my_rate * hours * total_workers
 
-        workers_count = 0
-        j = i + 1
-
-        if j < len(messages):
-            next_text = messages[j]['text'].strip()
-            wc = parse_workers_count(next_text)
-            if wc:
-                workers_count = wc
-                j += 1
-                while j < len(messages) and is_card_number(messages[j]['text']):
-                    j += 1
-            else:
-                while j < len(messages) and is_card_number(messages[j]['text']):
-                    workers_count += 1
-                    j += 1
-
-        if workers_count == 0:
-            workers_count = 1
-
-        my_total = my_rate * hours * workers_count
-
-        if workers_count > 1:
-            per_person = int(my_total / workers_count)
-            label = workers_ua.get(workers_count, f'За {workers_count}')
-            report_text = f"{location} по {per_person} ({hours})\n{label}"
+        if total_workers > 1:
+            per_person = int(my_total / total_workers)
+            label = workers_ua.get(total_workers, f'За {total_workers}')
+            report_text = f"{loc} по {per_person} ({hours})\n{label}"
         else:
-            report_text = f"{location} по {int(my_total)} ({hours})"
+            report_text = f"{loc} по {int(my_total)} ({hours})"
 
         reports.append(report_text)
-        i = j
 
     return reports
 
@@ -557,7 +576,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    # Обработка ввода даты вручную
     if current_report_date.get(user_id) == "waiting_date":
         text_input = update.message.text.strip()
         try:
