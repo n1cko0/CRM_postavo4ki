@@ -440,18 +440,24 @@ def build_report_and_stats(report_date: str):
         if loc not in grouped:
             grouped[loc] = {
                 'location': loc,
-                'hours': block['hours'],
+                'hours': block['hours'] if block['hours'] > 0 else 0,
                 'total_workers': 0,
                 'paid_to_workers': 0.0,
             }
             grouped_order.append(loc)
+        elif grouped[loc]['hours'] == 0 and block['hours'] > 0:
+            # перше повідомлення для цієї локації мало (0) годин — беремо години з наступного блоку
+            grouped[loc]['hours'] = block['hours']
 
-        if block['za_kilkokh'] > 0:
-            grouped[loc]['total_workers'] += block['za_kilkokh']
-        elif block['cards_count'] > 0:
-            grouped[loc]['total_workers'] += block['cards_count']
-        else:
-            grouped[loc]['total_workers'] += 1
+        # (0) годин — це особиста доплата (наприклад водію), яка йде тільки в мінус,
+        # але не рахується як офіційний вантажник для звіту логістам
+        if block['hours'] > 0:
+            if block['za_kilkokh'] > 0:
+                grouped[loc]['total_workers'] += block['za_kilkokh']
+            elif block['cards_count'] > 0:
+                grouped[loc]['total_workers'] += block['cards_count']
+            else:
+                grouped[loc]['total_workers'] += 1
 
         grouped[loc]['paid_to_workers'] += block['raw_amount']
 
