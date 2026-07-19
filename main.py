@@ -638,8 +638,10 @@ def get_reports_list_keyboard():
 
 
 # ==================== ВІДПРАВКА ПОСТАВОК ====================
-async def send_deliveries_msg(update: Update, filter_date: date = None):
-    await update.message.reply_text("⏳ Завантажую дані з таблиці...")
+async def send_deliveries_msg(update: Update, context: ContextTypes.DEFAULT_TYPE, filter_date: date = None):
+    chat_id = update.effective_chat.id
+    bot = context.bot
+    await send_with_retry(bot, chat_id, "⏳ Завантажую дані з таблиці...")
     try:
         all_values, merged_cells = get_sheet_data()
         routes = parse_routes(all_values, merged_cells)
@@ -647,32 +649,31 @@ async def send_deliveries_msg(update: Update, filter_date: date = None):
 
         if not messages:
             date_info = filter_date.strftime("%d.%m.%Y") if filter_date else ""
-            await update.message.reply_text(
+            await send_with_retry(
+                bot, chat_id,
                 f"❌ Поставок {'на ' + date_info if date_info else ''} не знайдено."
             )
             return
 
         date_info = filter_date.strftime("%d.%m.%Y") if filter_date else "всі"
-        await update.message.reply_text(
+        await send_with_retry(
+            bot, chat_id,
             f"✅ Знайдено поставок: *{len(messages)}* (дата: {date_info})",
             parse_mode="Markdown"
         )
 
         for msg_data in messages:
-            try:
-                await update.message.reply_text(msg_data["text"], parse_mode="Markdown")
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                logger.warning(f"Помилка відправки, чекаємо: {e}")
-                await asyncio.sleep(2)
-                await update.message.reply_text(msg_data["text"], parse_mode="Markdown")
+            await send_with_retry(bot, chat_id, msg_data["text"], parse_mode="Markdown")
+            await asyncio.sleep(0.35)
 
     except Exception as e:
         logger.error(f"Помилка: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Помилка: {str(e)}")
+        await send_with_retry(bot, chat_id, f"❌ Помилка: {str(e)}")
 
 
-async def send_deliveries_query(query, filter_date: date = None):
+async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, filter_date: date = None):
+    chat_id = query.message.chat_id
+    bot = context.bot
     await query.edit_message_text("⏳ Завантажую дані з таблиці...")
     try:
         all_values, merged_cells = get_sheet_data()
@@ -681,29 +682,26 @@ async def send_deliveries_query(query, filter_date: date = None):
 
         if not messages:
             date_info = filter_date.strftime("%d.%m.%Y") if filter_date else ""
-            await query.message.reply_text(
+            await send_with_retry(
+                bot, chat_id,
                 f"❌ Поставок {'на ' + date_info if date_info else ''} не знайдено."
             )
             return
 
         date_info = filter_date.strftime("%d.%m.%Y") if filter_date else "всі"
-        await query.message.reply_text(
+        await send_with_retry(
+            bot, chat_id,
             f"✅ Знайдено поставок: *{len(messages)}* (дата: {date_info})",
             parse_mode="Markdown"
         )
 
         for msg_data in messages:
-            try:
-                await query.message.reply_text(msg_data["text"], parse_mode="Markdown")
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                logger.warning(f"Помилка відправки, чекаємо: {e}")
-                await asyncio.sleep(2)
-                await query.message.reply_text(msg_data["text"], parse_mode="Markdown")
+            await send_with_retry(bot, chat_id, msg_data["text"], parse_mode="Markdown")
+            await asyncio.sleep(0.35)
 
     except Exception as e:
         logger.error(f"Помилка: {e}", exc_info=True)
-        await query.message.reply_text(f"❌ Помилка: {str(e)}")
+        await send_with_retry(bot, chat_id, f"❌ Помилка: {str(e)}")
 
 
 # ==================== КОМАНДИ ====================
@@ -859,11 +857,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
     elif text == "📋 Всі поставки":
-        await send_deliveries_msg(update, filter_date=None)
+        await send_deliveries_msg(update, context, filter_date=None)
     elif text == "📅 На сьогодні":
-        await send_deliveries_msg(update, filter_date=date.today())
+        await send_deliveries_msg(update, context, filter_date=date.today())
     elif text == "📅 На завтра":
-        await send_deliveries_msg(update, filter_date=date.today() + timedelta(days=1))
+        await send_deliveries_msg(update, context, filter_date=date.today() + timedelta(days=1))
     elif text == "🔢 На конкретну дату":
         keyboard = []
         for i in range(7):
@@ -910,7 +908,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_str = data.replace("date_", "")
         try:
             filter_date = datetime.strptime(date_str, "%d.%m.%Y").date()
-            await send_deliveries_query(query, filter_date=filter_date)
+            await send_deliveries_query(query, context, filter_date=filter_date)
         except ValueError:
             await query.edit_message_text("Помилка дати")
 
