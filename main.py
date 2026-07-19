@@ -583,8 +583,6 @@ async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_USERS:
         return
-    if update.message.chat.type in ['group', 'supergroup']:
-        return
 
     user_id = update.effective_user.id
 
