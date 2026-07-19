@@ -8,6 +8,7 @@ from datetime import datetime, date, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # ==================== НАСТРОЙКИ ====================
@@ -531,6 +532,30 @@ def format_stats_message(report_date: str, stats: dict) -> str:
     return "\n".join(lines)
 
 
+async def send_with_retry(bot, chat_id: int, text: str, parse_mode: str = None, max_retries: int = 5):
+    """Отправка с обробкою Telegram flood control (RetryAfter) та інших тимчасових помилок."""
+    for attempt in range(max_retries):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            return
+        except RetryAfter as e:
+            wait = e.retry_after + 1
+            logger.warning(f"Flood control, чекаємо {wait}с (спроба {attempt + 1})")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            logger.warning(f"Помилка відправки, чекаємо 2с: {e}")
+            await asyncio.sleep(2)
+    # остання спроба без придушення помилки — щоб вона стала видною в логах
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+
+
+async def send_report_and_stats(bot, chat_id: int, report_date: str, reports: list, stats: dict):
+    for r in reports:
+        await send_with_retry(bot, chat_id, r)
+        await asyncio.sleep(0.3)
+    await send_with_retry(bot, chat_id, format_stats_message(report_date, stats), parse_mode="Markdown")
+
+
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.chat.id != REPORT_GROUP_ID:
@@ -906,13 +931,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Немає даних для звіту.")
             return
         await query.edit_message_text(f"✅ Звіт за {report_date}:")
-        for r in reports:
-            await context.bot.send_message(chat_id=query.message.chat_id, text=r)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=format_stats_message(report_date, stats),
-            parse_mode="Markdown"
-        )
+        await send_report_and_stats(context.bot, query.message.chat_id, report_date, reports, stats)
 
     elif data == "rback":
         keyboard, dates = get_reports_list_keyboard()
@@ -945,13 +964,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Немає даних для звіту за {d}.")
             return
         await query.edit_message_text(f"✅ Звіт за {d}:")
-        for r in reports:
-            await context.bot.send_message(chat_id=query.message.chat_id, text=r)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=format_stats_message(d, stats),
-            parse_mode="Markdown"
-        )
+        await send_report_and_stats(context.bot, query.message.chat_id, d, reports, stats)
 
     elif data.startswith("rdate_"):
         d = data.replace("rdate_", "")
