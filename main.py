@@ -42,15 +42,44 @@ BUTTON_TEXTS = {
 
 # ==================== МІСТА ====================
 def load_cities() -> dict:
-    if os.path.exists(CITIES_FILE):
-        with open(CITIES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    """Формат: {"Назва": {"rate": 200, "aliases": ["Скорочення", ...]}}.
+    Старий плоский формат {"Назва": 200} мігрується автоматично."""
+    if not os.path.exists(CITIES_FILE):
+        return {}
+
+    with open(CITIES_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    migrated = False
+    for name, info in list(data.items()):
+        if isinstance(info, (int, float)):
+            data[name] = {"rate": info, "aliases": []}
+            migrated = True
+        elif isinstance(info, dict) and "aliases" not in info:
+            info["aliases"] = []
+            migrated = True
+
+    if migrated:
+        with open(CITIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return data
 
 
 def save_cities(cities: dict):
     with open(CITIES_FILE, "w", encoding="utf-8") as f:
         json.dump(cities, f, ensure_ascii=False, indent=2)
+
+
+def build_city_index(cities: dict) -> dict:
+    """Ключ у нижньому регістрі (назва або синонім) -> канонічна назва міста."""
+    index = {}
+    for city_name, info in cities.items():
+        aliases = info.get("aliases", []) if isinstance(info, dict) else []
+        index[city_name.lower()] = city_name
+        for alias in aliases:
+            index[alias.lower()] = city_name
+    return index
 
 
 # ==================== ЗБЕРЕЖЕННЯ ЗВІТІВ (переживає рестарт бота) ====================
@@ -332,6 +361,19 @@ def parse_workers_count(text: str):
     return mapping.get(text.strip().lower())
 
 
+def match_city(location: str, cities: dict):
+    """Шукає місто за точним співпадінням назви або явного синоніма
+    (тільки якщо location починається саме з цього слова)."""
+    loc_lower = location.lower()
+    index = build_city_index(cities)
+    best_key = None
+    for key in index.keys():
+        if loc_lower.startswith(key):
+            if best_key is None or len(key) > len(best_key):
+                best_key = key
+    return index[best_key] if best_key else None
+
+
 def format_hours(hours: float) -> str:
     if hours == int(hours):
         return str(int(hours))
@@ -416,13 +458,9 @@ def build_report_and_stats(report_date: str):
 
     for loc in grouped_order:
         data = grouped[loc]
-        city = None
-        for city_name in cities.keys():
-            if data['location'].lower().startswith(city_name.lower()):
-                city = city_name
-                break
+        city = match_city(data['location'], cities)
 
-        my_rate = cities.get(city, 0) if city else 0
+        my_rate = cities.get(city, {}).get('rate', 0) if city else 0
         hours = data['hours']
         total_workers = data['total_workers']
         my_total = my_rate * hours * total_workers
@@ -642,9 +680,19 @@ async def mycities(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Список міст порожній.")
         return
     text = "🏙 *Мої міста:*\n\n"
-    for city, rate in sorted(cities.items()):
-        text += f"📍 {city} — {rate} грн/год\n"
-    text += "\nЩоб додати: /addcity Назва Тариф\nЩоб видалити: /removecity Назва"
+    for city, info in sorted(cities.items()):
+        rate = info.get('rate', 0)
+        aliases = info.get('aliases', [])
+        text += f"📍 {city} — {rate} грн/год"
+        if aliases:
+            text += f" (синоніми: {', '.join(aliases)})"
+        text += "\n"
+    text += (
+        "\nЩоб додати місто: /addcity Назва Тариф"
+        "\nЩоб видалити місто: /removecity Назва"
+        "\nЩоб додати синонім: /addalias Назва Синонім"
+        "\nЩоб видалити синонім: /removealias Синонім"
+    )
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -662,7 +710,8 @@ async def addcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Тариф має бути числом.")
         return
     cities = load_cities()
-    cities[city_name] = rate
+    existing_aliases = cities.get(city_name, {}).get('aliases', [])
+    cities[city_name] = {"rate": rate, "aliases": existing_aliases}
     save_cities(cities)
     await update.message.reply_text(f"✅ Додано: {city_name} — {rate} грн/год")
 
@@ -681,6 +730,52 @@ async def removecity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Видалено: {city_name}")
     else:
         await update.message.reply_text(f"❌ Місто '{city_name}' не знайдено.")
+
+
+async def addalias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Використання: /addalias Назва Синонім\n"
+            "Приклад: /addalias Могилів-Подільський Могилів"
+        )
+        return
+    alias = context.args[-1]
+    city_name = " ".join(context.args[:-1])
+    cities = load_cities()
+    if city_name not in cities:
+        await update.message.reply_text(
+            f"❌ Місто '{city_name}' не знайдено. Спочатку додайте його: /addcity {city_name} <тариф>"
+        )
+        return
+    aliases = cities[city_name].get('aliases', [])
+    if alias.lower() in [a.lower() for a in aliases]:
+        await update.message.reply_text(f"⚠️ Синонім '{alias}' вже є у '{city_name}'.")
+        return
+    aliases.append(alias)
+    cities[city_name]['aliases'] = aliases
+    save_cities(cities)
+    await update.message.reply_text(f"✅ Додано синонім: '{alias}' → {city_name}")
+
+
+async def removealias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    if not context.args:
+        await update.message.reply_text("Використання: /removealias Синонім\nПриклад: /removealias Могилів")
+        return
+    alias = " ".join(context.args)
+    cities = load_cities()
+    for city_name, info in cities.items():
+        aliases = info.get('aliases', [])
+        new_aliases = [a for a in aliases if a.lower() != alias.lower()]
+        if len(new_aliases) != len(aliases):
+            info['aliases'] = new_aliases
+            save_cities(cities)
+            await update.message.reply_text(f"✅ Синонім '{alias}' видалено з '{city_name}'.")
+            return
+    await update.message.reply_text(f"❌ Синонім '{alias}' не знайдено.")
 
 
 # ==================== TEXT HANDLER ====================
@@ -875,6 +970,8 @@ def main():
     app.add_handler(CommandHandler("mycities", mycities))
     app.add_handler(CommandHandler("addcity", addcity))
     app.add_handler(CommandHandler("removecity", removecity))
+    app.add_handler(CommandHandler("addalias", addalias))
+    app.add_handler(CommandHandler("removealias", removealias))
 
     # group=0: сначала пробуем перехватить сообщение в группе как "оплату"
     app.add_handler(MessageHandler(
