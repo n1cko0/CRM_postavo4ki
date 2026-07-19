@@ -583,9 +583,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_report_date[user_id] = text_input
             if text_input not in payment_sessions:
                 payment_sessions[text_input] = []
+            keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
             await update.message.reply_text(
-                f"✅ Дата звіту: {text_input}\n\nТепер скидайте оплати в групу.",
-                reply_markup=get_main_keyboard()
+                f"✅ Дата звіту: {text_input}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except ValueError:
             await update.message.reply_text("❌ Невірний формат. Введіть дату як ДД.ММ.РРРР")
