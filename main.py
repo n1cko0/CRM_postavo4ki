@@ -11,7 +11,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8971446928:AAF32e4fMvi9KQkcFKK924K1QbxwMbtNzzs")
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берём только из переменной окружения Railway
 SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
 CITIES_FILE = "cities.json"
@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 payment_sessions = {}
 current_report_date = {}
+
+# Тексты кнопок Reply Keyboard — их нельзя перехватывать как оплату/карту в группе
+BUTTON_TEXTS = {
+    "📦 Поставки", "🏙 Мої міста", "📊 Звіт",
+    "📋 Всі поставки", "📅 На сьогодні", "📅 На завтра",
+    "🔢 На конкретну дату", "◀️ Назад",
+}
 
 
 # ==================== МІСТА ====================
@@ -408,6 +415,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     text = msg.text or ""
     if not text:
         return
+    if text in BUTTON_TEXTS:
+        return  # это нажатие кнопки меню, а не оплата — не перехватываем
 
     user_id = msg.from_user.id
     if user_id not in current_report_date:
@@ -709,11 +718,17 @@ def main():
     app.add_handler(CommandHandler("mycities", mycities))
     app.add_handler(CommandHandler("addcity", addcity))
     app.add_handler(CommandHandler("removecity", removecity))
+
+    # group=0: сначала пробуем перехватить сообщение в группе как "оплату"
     app.add_handler(MessageHandler(
         filters.Chat(REPORT_GROUP_ID) & filters.TEXT & ~filters.COMMAND,
         group_message_handler
-    ))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    ), group=0)
+
+    # group=1: этот хендлер получит апдейт НЕЗАВИСИМО от того, что сделал group_message_handler,
+    # поэтому кнопки в группе теперь тоже будут обрабатываться
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), group=1)
+
     app.add_handler(CallbackQueryHandler(button_handler))
     logger.info("Бот запущено!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
