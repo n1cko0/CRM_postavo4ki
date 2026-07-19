@@ -11,10 +11,11 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берём только из переменной окружения Railway
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берём тільки з env
 SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
 CITIES_FILE = "cities.json"
+REPORTS_FILE = "reports.json"
 ALLOWED_USERS = [7305470549, 506094120]
 REPORT_GROUP_ID = -5344273524
 
@@ -29,12 +30,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-payment_sessions = {}
 current_report_date = {}
 
 # Тексты кнопок Reply Keyboard — их нельзя перехватывать как оплату/карту в группе
 BUTTON_TEXTS = {
-    "📦 Поставки", "🏙 Мої міста", "📊 Звіт",
+    "📦 Поставки", "🏙 Мої міста", "📊 Звіт", "🗂 Мої звіти",
     "📋 Всі поставки", "📅 На сьогодні", "📅 На завтра",
     "🔢 На конкретну дату", "◀️ Назад",
 }
@@ -51,6 +51,22 @@ def load_cities() -> dict:
 def save_cities(cities: dict):
     with open(CITIES_FILE, "w", encoding="utf-8") as f:
         json.dump(cities, f, ensure_ascii=False, indent=2)
+
+
+# ==================== ЗБЕРЕЖЕННЯ ЗВІТІВ (переживає рестарт бота) ====================
+def load_reports_data() -> dict:
+    if os.path.exists(REPORTS_FILE):
+        with open(REPORTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_reports_data():
+    with open(REPORTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reports_data, f, ensure_ascii=False, indent=2)
+
+
+reports_data = load_reports_data()  # { "дд.мм.рррр": {"messages": [...]} }
 
 
 # ==================== GOOGLE SHEETS ====================
@@ -279,7 +295,7 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
     return messages
 
 
-# ==================== ЗВІТ ====================
+# ==================== ЗВІТ ТА СТАТИСТИКА ====================
 def parse_payment_message(text: str):
     """Парсим первую строку сообщения об оплате"""
     first_line = text.strip().split('\n')[0].strip()
@@ -288,7 +304,7 @@ def parse_payment_message(text: str):
     if not match:
         return None
     location = match.group(1).strip()
-    amount_per_person = float(match.group(2).replace(',', '.'))
+    amount = float(match.group(2).replace(',', '.'))
     hours = float(match.group(3).replace(',', '.'))
 
     # Ищем "за двох/трьох..." в остальных строках того же сообщения
@@ -302,7 +318,7 @@ def parse_payment_message(text: str):
 
     return {
         'location': location,
-        'amount_per_person': amount_per_person,
+        'amount': amount,  # сколько реально заплачено вантажникам за цей блок
         'hours': hours,
         'za_kilkokh': za_kilkokh,
     }
@@ -321,10 +337,12 @@ def is_card_number(text: str) -> bool:
     return cleaned.isdigit() and len(cleaned) >= 12
 
 
-def build_report(report_date: str) -> list:
-    messages = payment_sessions.get(report_date, [])
+def build_report_and_stats(report_date: str):
+    """Возвращает (список строк отчёта, словарь статистики). Считается заново из сырых сообщений."""
+    session = reports_data.get(report_date, {})
+    messages = session.get("messages", [])
     if not messages:
-        return []
+        return [], {}
 
     cities = load_cities()
     workers_ua = {
@@ -346,8 +364,9 @@ def build_report(report_date: str) -> list:
             current_block = {
                 'location': payment['location'],
                 'hours': payment['hours'],
-                'za_kilkokh': payment['za_kilkokh'],  # ← берём из сообщения
+                'za_kilkokh': payment['za_kilkokh'],
                 'cards_count': 0,
+                'raw_amount': payment['amount'],
             }
         elif current_block:
             wc = parse_workers_count(text)
@@ -359,7 +378,7 @@ def build_report(report_date: str) -> list:
     if current_block:
         blocks.append(current_block)
 
-    # Группируем блоки по локации
+    # Группируем блоки по локации (для текста отчёта)
     grouped = {}
     grouped_order = []
     for block in blocks:
@@ -369,6 +388,7 @@ def build_report(report_date: str) -> list:
                 'location': loc,
                 'hours': block['hours'],
                 'total_workers': 0,
+                'paid_to_workers': 0.0,
             }
             grouped_order.append(loc)
 
@@ -379,8 +399,15 @@ def build_report(report_date: str) -> list:
         else:
             grouped[loc]['total_workers'] += 1
 
-    # Формируем отчёт
+        grouped[loc]['paid_to_workers'] += block['raw_amount']
+
+    # Формируем текст отчёта + собираем статистику по городам
     reports = []
+    city_stats = {}
+    total_paid = 0.0
+    total_income = 0.0
+    total_manhours = 0.0
+
     for loc in grouped_order:
         data = grouped[loc]
         city = None
@@ -393,16 +420,70 @@ def build_report(report_date: str) -> list:
         hours = data['hours']
         total_workers = data['total_workers']
         my_total = my_rate * hours * total_workers
+        paid = data['paid_to_workers']
 
         if total_workers > 1:
             label = workers_ua.get(total_workers, f'За {total_workers}')
             report_text = f"{loc} по {int(my_total)} ({hours})\n{label}"
         else:
             report_text = f"{loc} по {int(my_total)} ({hours})"
-
         reports.append(report_text)
 
-    return reports
+        total_paid += paid
+        total_income += my_total
+        total_manhours += hours * total_workers
+
+        city_key = city if city else data['location']
+        if city_key not in city_stats:
+            city_stats[city_key] = {'paid': 0.0, 'income': 0.0}
+        city_stats[city_key]['paid'] += paid
+        city_stats[city_key]['income'] += my_total
+
+    city_list = []
+    for city_name, vals in city_stats.items():
+        profit = vals['income'] - vals['paid']
+        city_list.append({
+            'city': city_name,
+            'paid': vals['paid'],
+            'income': vals['income'],
+            'profit': profit,
+        })
+    city_list.sort(key=lambda x: x['profit'], reverse=True)
+
+    stats = {
+        'total_paid': total_paid,
+        'total_income': total_income,
+        'total_profit': total_income - total_paid,
+        'total_manhours': total_manhours,
+        'cities': city_list,
+    }
+
+    return reports, stats
+
+
+def format_stats_message(report_date: str, stats: dict) -> str:
+    if not stats:
+        return "❌ Немає даних для статистики."
+
+    lines = [f"📊 *Статистика за {report_date}*", ""]
+    lines.append(f"💸 Заплачено вантажникам: {int(stats['total_paid'])} грн")
+    lines.append(f"💰 Отримаю за роботу: {int(stats['total_income'])} грн")
+
+    profit = stats['total_profit']
+    emoji = "📈" if profit >= 0 else "📉"
+    lines.append(f"{emoji} Чистий прибуток: {int(profit)} грн")
+
+    if stats['total_manhours'] > 0:
+        lines.append(f"⏱ Людино-годин відпрацьовано: {stats['total_manhours']:.1f}")
+        lines.append(f"📐 Маржа на людино-годину: {profit / stats['total_manhours']:.1f} грн")
+
+    if stats['cities']:
+        lines.append("")
+        lines.append("🏙 *Міста за прибутковістю:*")
+        for i, c in enumerate(stats['cities'], start=1):
+            lines.append(f"{i}. {c['city']} — {int(c['profit'])} грн")
+
+    return "\n".join(lines)
 
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -426,14 +507,13 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if report_date == "waiting_date":
         return
 
-    if report_date not in payment_sessions:
-        payment_sessions[report_date] = []
-
-    payment_sessions[report_date].append({
+    reports_data.setdefault(report_date, {"messages": []})
+    reports_data[report_date]["messages"].append({
         'text': text,
         'timestamp': msg.date.isoformat(),
         'message_id': msg.message_id,
     })
+    save_reports_data()
 
 
 # ==================== KEYBOARDS ====================
@@ -442,6 +522,7 @@ def get_main_keyboard():
         [
             ["📦 Поставки"],
             ["🏙 Мої міста", "📊 Звіт"],
+            ["🗂 Мої звіти"],
         ],
         resize_keyboard=True
     )
@@ -457,6 +538,13 @@ def get_deliveries_keyboard():
         ],
         resize_keyboard=True
     )
+
+
+def get_reports_list_keyboard():
+    dates = list(reports_data.keys())
+    dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"), reverse=True)
+    keyboard = [[InlineKeyboardButton(d, callback_data=f"rdate_{d}")] for d in dates]
+    return keyboard, dates
 
 
 # ==================== ВІДПРАВКА ПОСТАВОК ====================
@@ -600,8 +688,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             datetime.strptime(text_input, "%d.%m.%Y")
             current_report_date[user_id] = text_input
-            if text_input not in payment_sessions:
-                payment_sessions[text_input] = []
+            reports_data.setdefault(text_input, {"messages": []})
+            save_reports_data()
             keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
             await update.message.reply_text(
                 f"✅ Дата звіту: {text_input}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -651,6 +739,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Оберіть дату звіту:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+    elif text == "🗂 Мої звіти":
+        keyboard, dates = get_reports_list_keyboard()
+        if not dates:
+            await update.message.reply_text("❌ Поки немає жодного звіту.")
+        else:
+            await update.message.reply_text(
+                "Оберіть дату звіту:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
 
 
 # ==================== CALLBACK HANDLER ====================
@@ -673,8 +770,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "report_yesterday":
         d = (date.today() - timedelta(days=1)).strftime("%d.%m.%Y")
         current_report_date[query.from_user.id] = d
-        if d not in payment_sessions:
-            payment_sessions[d] = []
+        reports_data.setdefault(d, {"messages": []})
+        save_reports_data()
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
             f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -684,8 +781,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "report_today":
         d = date.today().strftime("%d.%m.%Y")
         current_report_date[query.from_user.id] = d
-        if d not in payment_sessions:
-            payment_sessions[d] = []
+        reports_data.setdefault(d, {"messages": []})
+        save_reports_data()
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
             f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -702,13 +799,58 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Спочатку оберіть дату звіту.")
             return
         report_date = current_report_date[user_id]
-        reports = build_report(report_date)
+        reports, stats = build_report_and_stats(report_date)
         if not reports:
             await query.edit_message_text("❌ Немає даних для звіту.")
             return
         await query.edit_message_text(f"✅ Звіт за {report_date}:")
         for r in reports:
             await query.message.reply_text(r)
+        await query.message.reply_text(format_stats_message(report_date, stats), parse_mode="Markdown")
+
+    elif data == "rback":
+        keyboard, dates = get_reports_list_keyboard()
+        if not dates:
+            await query.edit_message_text("❌ Поки немає жодного звіту.")
+        else:
+            await query.edit_message_text("Оберіть дату звіту:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("rdelconfirm_"):
+        d = data.replace("rdelconfirm_", "")
+        reports_data.pop(d, None)
+        save_reports_data()
+        await query.edit_message_text(f"✅ Звіт за {d} видалено.")
+
+    elif data.startswith("rdel_"):
+        d = data.replace("rdel_", "")
+        keyboard = [
+            [InlineKeyboardButton("✅ Так, видалити", callback_data=f"rdelconfirm_{d}")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data=f"rdate_{d}")],
+        ]
+        await query.edit_message_text(
+            f"Видалити звіт за {d}? Цю дію не можна скасувати.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("rview_"):
+        d = data.replace("rview_", "")
+        reports, stats = build_report_and_stats(d)
+        if not reports:
+            await query.edit_message_text(f"❌ Немає даних для звіту за {d}.")
+            return
+        await query.edit_message_text(f"✅ Звіт за {d}:")
+        for r in reports:
+            await query.message.reply_text(r)
+        await query.message.reply_text(format_stats_message(d, stats), parse_mode="Markdown")
+
+    elif data.startswith("rdate_"):
+        d = data.replace("rdate_", "")
+        keyboard = [
+            [InlineKeyboardButton("👁 Переглянути", callback_data=f"rview_{d}")],
+            [InlineKeyboardButton("🗑 Видалити", callback_data=f"rdel_{d}")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="rback")],
+        ]
+        await query.edit_message_text(f"Звіт за {d}:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 # ==================== MAIN ====================
@@ -725,8 +867,8 @@ def main():
         group_message_handler
     ), group=0)
 
-    # group=1: этот хендлер получит апдейт НЕЗАВИСИМО от того, что сделал group_message_handler,
-    # поэтому кнопки в группе теперь тоже будут обрабатываться
+    # group=1: этот хендлер получит апдейт независимо от того, что сделал group_message_handler,
+    # поэтому кнопки в группе тоже обрабатываются
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), group=1)
 
     app.add_handler(CallbackQueryHandler(button_handler))
