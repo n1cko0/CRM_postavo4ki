@@ -274,17 +274,30 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
 
 # ==================== ЗВІТ ====================
 def parse_payment_message(text: str):
+    """Парсим первую строку сообщения об оплате"""
+    first_line = text.strip().split('\n')[0].strip()
     pattern = r'^(.+?)\s+по\s+(\d+(?:[.,]\d+)?)\s+\((\d+(?:[.,]\d+)?)\)'
-    match = re.match(pattern, text.strip())
+    match = re.match(pattern, first_line)
     if not match:
         return None
     location = match.group(1).strip()
     amount_per_person = float(match.group(2).replace(',', '.'))
     hours = float(match.group(3).replace(',', '.'))
+
+    # Ищем "за двох/трьох..." в остальных строках того же сообщения
+    za_kilkokh = 0
+    lines = text.strip().split('\n')
+    for line in lines[1:]:
+        wc = parse_workers_count(line.strip())
+        if wc:
+            za_kilkokh = wc
+            break
+
     return {
         'location': location,
         'amount_per_person': amount_per_person,
         'hours': hours,
+        'za_kilkokh': za_kilkokh,
     }
 
 
@@ -326,7 +339,7 @@ def build_report(report_date: str) -> list:
             current_block = {
                 'location': payment['location'],
                 'hours': payment['hours'],
-                'za_kilkokh': 0,
+                'za_kilkokh': payment['za_kilkokh'],  # ← берём из сообщения
                 'cards_count': 0,
             }
         elif current_block:
