@@ -15,8 +15,13 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берём тільки з env
 SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 CREDENTIALS_FILE = "credentials.json"
-CITIES_FILE = "cities.json"
-REPORTS_FILE = "reports.json"
+
+# RAILWAY_VOLUME_MOUNT_PATH встановлюється Railway автоматично, якщо до сервісу
+# прикріплено Volume. Локально (в PyCharm) цієї змінної немає — тоді файли
+# зберігаються поруч зі скриптом, як і раніше.
+DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".")
+CITIES_FILE = os.path.join(DATA_DIR, "cities.json")
+REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")
 ALLOWED_USERS = [7305470549, 506094120]
 REPORT_GROUP_ID = -5344273524
 
