@@ -388,9 +388,8 @@ def build_report(report_date: str) -> list:
         my_total = my_rate * hours * total_workers
 
         if total_workers > 1:
-            per_person = int(my_total / total_workers)
             label = workers_ua.get(total_workers, f'За {total_workers}')
-            report_text = f"{loc} по {per_person} ({hours})\n{label}"
+            report_text = f"{loc} по {int(my_total)} ({hours})\n{label}"
         else:
             report_text = f"{loc} по {int(my_total)} ({hours})"
 
