@@ -332,6 +332,12 @@ def parse_workers_count(text: str):
     return mapping.get(text.strip().lower())
 
 
+def format_hours(hours: float) -> str:
+    if hours == int(hours):
+        return str(int(hours))
+    return str(hours)
+
+
 def is_card_number(text: str) -> bool:
     cleaned = re.sub(r'[\s\-]', '', text.strip().lstrip('*').strip())
     return cleaned.isdigit() and len(cleaned) >= 12
@@ -422,11 +428,12 @@ def build_report_and_stats(report_date: str):
         my_total = my_rate * hours * total_workers
         paid = data['paid_to_workers']
 
+        hours_str = format_hours(hours)
         if total_workers > 1:
             label = workers_ua.get(total_workers, f'За {total_workers}')
-            report_text = f"{loc} по {int(my_total)} ({hours})\n{label}"
+            report_text = f"{loc} по {int(my_total)} ({hours_str})\n{label}"
         else:
-            report_text = f"{loc} по {int(my_total)} ({hours})"
+            report_text = f"{loc} по {int(my_total)} ({hours_str})"
         reports.append(report_text)
 
         total_paid += paid
@@ -805,8 +812,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text(f"✅ Звіт за {report_date}:")
         for r in reports:
-            await query.message.reply_text(r)
-        await query.message.reply_text(format_stats_message(report_date, stats), parse_mode="Markdown")
+            await context.bot.send_message(chat_id=query.message.chat_id, text=r)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=format_stats_message(report_date, stats),
+            parse_mode="Markdown"
+        )
 
     elif data == "rback":
         keyboard, dates = get_reports_list_keyboard()
@@ -840,8 +851,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text(f"✅ Звіт за {d}:")
         for r in reports:
-            await query.message.reply_text(r)
-        await query.message.reply_text(format_stats_message(d, stats), parse_mode="Markdown")
+            await context.bot.send_message(chat_id=query.message.chat_id, text=r)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=format_stats_message(d, stats),
+            parse_mode="Markdown"
+        )
 
     elif data.startswith("rdate_"):
         d = data.replace("rdate_", "")
