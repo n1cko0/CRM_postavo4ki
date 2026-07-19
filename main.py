@@ -24,6 +24,7 @@ CITIES_FILE = os.path.join(DATA_DIR, "cities.json")
 REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")
 ALLOWED_USERS = [7305470549, 506094120]
 REPORT_GROUP_ID = -5344273524
+MY_CARD_NUMBER = "4441111134286644"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -564,6 +565,14 @@ async def send_report_and_stats(bot, chat_id: int, report_date: str, reports: li
     for r in reports:
         await send_with_retry(bot, chat_id, r)
         await asyncio.sleep(0.3)
+
+    # службові повідомлення для логістів: за яку дату звіт і куди переказати оплату
+    await send_with_retry(bot, chat_id, f"ЗА {report_date}")
+    await asyncio.sleep(0.3)
+    await send_with_retry(bot, chat_id, MY_CARD_NUMBER)
+    await asyncio.sleep(0.3)
+
+    # особистий підсумок — тільки для мене, останнім повідомленням
     await send_with_retry(bot, chat_id, format_stats_message(report_date, stats), parse_mode="Markdown")
 
 
