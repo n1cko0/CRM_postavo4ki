@@ -38,6 +38,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 current_report_date = {}
+edit_state = {}  # user_id -> {"date": ..., "location": ..., "field": "hours"|"workers"|"paid"}
+
+FIELD_LABELS = {
+    "hours": "години",
+    "workers": "кількість людей",
+    "paid": "сума виплат (те, що я реально заплатив)",
+}
+FIELD_TO_OVERRIDE_KEY = {
+    "hours": "hours",
+    "workers": "total_workers",
+    "paid": "paid_to_workers",
+}
 
 # Тексты кнопок Reply Keyboard — их нельзя перехватывать как оплату/карту в группе
 BUTTON_TEXTS = {
@@ -392,18 +404,16 @@ def is_card_number(text: str) -> bool:
     return cleaned.isdigit() and len(cleaned) >= 12
 
 
-def build_report_and_stats(report_date: str):
-    """Возвращает (список строк отчёта, словарь статистики). Считается заново из сырых сообщений."""
+def compute_location_data(report_date: str) -> list:
+    """Повертає впорядкований список локацій з годинами/кількістю людей/сумою виплат/тарифом/доходом.
+    Враховує ручні правки (overrides), якщо вони є."""
     session = reports_data.get(report_date, {})
     messages = session.get("messages", [])
+    overrides = session.get("overrides", {})
     if not messages:
-        return [], {}
+        return []
 
     cities = load_cities()
-    workers_ua = {
-        1: '', 2: 'За двох', 3: 'За трьох',
-        4: 'За чотирьох', 5: "За п'ятьох", 6: 'За шістьох'
-    }
 
     # Группируем сообщения по блокам
     blocks = []
@@ -433,7 +443,7 @@ def build_report_and_stats(report_date: str):
     if current_block:
         blocks.append(current_block)
 
-    # Группируем блоки по локации (для текста отчёта)
+    # Группируем блоки по локации
     grouped = {}
     grouped_order = []
     for block in blocks:
@@ -467,22 +477,64 @@ def build_report_and_stats(report_date: str):
 
         grouped[loc]['paid_to_workers'] += block_paid
 
-    # Формируем текст отчёта + собираем статистику по городам
+    # Застосовуємо ручні правки (якщо є)
+    for loc in grouped_order:
+        if loc in overrides:
+            ov = overrides[loc]
+            if 'hours' in ov:
+                grouped[loc]['hours'] = ov['hours']
+            if 'total_workers' in ov:
+                grouped[loc]['total_workers'] = ov['total_workers']
+            if 'paid_to_workers' in ov:
+                grouped[loc]['paid_to_workers'] = ov['paid_to_workers']
+
+    result = []
+    for loc in grouped_order:
+        data = grouped[loc]
+        city = match_city(data['location'], cities)
+        my_rate = cities.get(city, {}).get('rate', 0) if city else 0
+        hours = data['hours']
+        total_workers = data['total_workers']
+        my_total = my_rate * hours * total_workers
+
+        result.append({
+            'location': loc,
+            'city': city,
+            'hours': hours,
+            'total_workers': total_workers,
+            'paid_to_workers': data['paid_to_workers'],
+            'rate': my_rate,
+            'income': my_total,
+            'edited': loc in overrides,
+        })
+
+    return result
+
+
+def build_report_and_stats(report_date: str):
+    """Возвращает (список строк отчёта, словарь статистики), с учётом ручных правок."""
+    locations = compute_location_data(report_date)
+    if not locations:
+        return [], {}
+
+    workers_ua = {
+        1: '', 2: 'За двох', 3: 'За трьох',
+        4: 'За чотирьох', 5: "За п'ятьох", 6: 'За шістьох'
+    }
+
     reports = []
     city_stats = {}
     total_paid = 0.0
     total_income = 0.0
     total_manhours = 0.0
 
-    for loc in grouped_order:
-        data = grouped[loc]
-        city = match_city(data['location'], cities)
-
-        my_rate = cities.get(city, {}).get('rate', 0) if city else 0
-        hours = data['hours']
-        total_workers = data['total_workers']
-        my_total = my_rate * hours * total_workers
-        paid = data['paid_to_workers']
+    for item in locations:
+        loc = item['location']
+        hours = item['hours']
+        total_workers = item['total_workers']
+        my_total = item['income']
+        paid = item['paid_to_workers']
+        city = item['city']
 
         hours_str = format_hours(hours)
         if total_workers > 1:
@@ -496,7 +548,7 @@ def build_report_and_stats(report_date: str):
         total_income += my_total
         total_manhours += hours * total_workers
 
-        city_key = city if city else data['location']
+        city_key = city if city else loc
         if city_key not in city_stats:
             city_stats[city_key] = {'paid': 0.0, 'income': 0.0}
         city_stats[city_key]['paid'] += paid
@@ -595,6 +647,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return  # это нажатие кнопки меню, а не оплата — не перехватываем
 
     user_id = msg.from_user.id
+    if user_id in edit_state:
+        return  # це введення нового значення при редагуванні позиції, а не оплата
     if user_id not in current_report_date:
         return
 
@@ -833,6 +887,42 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
+    if user_id in edit_state:
+        state = edit_state[user_id]
+        text_input = update.message.text.strip().replace(',', '.')
+        field = state['field']
+        try:
+            value = float(text_input)
+            if field == 'workers':
+                value = int(round(value))
+            if value < 0:
+                raise ValueError("negative")
+        except ValueError:
+            await update.message.reply_text("❌ Введіть коректне число (наприклад 2 або 2.5)")
+            return
+
+        report_date = state['date']
+        location = state['location']
+        override_key = FIELD_TO_OVERRIDE_KEY[field]
+
+        reports_data.setdefault(report_date, {"messages": []})
+        reports_data[report_date].setdefault('overrides', {})
+        reports_data[report_date]['overrides'].setdefault(location, {})
+        reports_data[report_date]['overrides'][location][override_key] = value
+        save_reports_data()
+
+        del edit_state[user_id]
+
+        keyboard = [
+            [InlineKeyboardButton("✏️ Редагувати ще", callback_data=f"rloc_{report_date}_{state['idx']}")],
+            [InlineKeyboardButton("◀️ До списку позицій", callback_data=f"redit_{report_date}")],
+        ]
+        await update.message.reply_text(
+            f"✅ Оновлено: {location} → {FIELD_LABELS[field]} = {value}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
     if current_report_date.get(user_id) == "waiting_date":
         text_input = update.message.text.strip()
         try:
@@ -993,10 +1083,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d = data.replace("rdate_", "")
         keyboard = [
             [InlineKeyboardButton("👁 Переглянути", callback_data=f"rview_{d}")],
+            [InlineKeyboardButton("✏️ Редагувати", callback_data=f"redit_{d}")],
             [InlineKeyboardButton("🗑 Видалити", callback_data=f"rdel_{d}")],
             [InlineKeyboardButton("◀️ Назад", callback_data="rback")],
         ]
         await query.edit_message_text(f"Звіт за {d}:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("redit_"):
+        d = data.replace("redit_", "")
+        locations = compute_location_data(d)
+        if not locations:
+            await query.edit_message_text(f"❌ Немає даних для звіту за {d}.")
+            return
+        keyboard = []
+        for idx, item in enumerate(locations):
+            mark = "✏️ " if item['edited'] else ""
+            label = f"{mark}{item['location']} — {int(item['income'])} грн ({item['total_workers']} люд.)"
+            if len(label) > 64:
+                label = label[:61] + "..."
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"rloc_{d}_{idx}")])
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"rdate_{d}")])
+        await query.edit_message_text(
+            f"Позиції звіту за {d}\n(✏️ — вже відредаговано):",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("rloc_"):
+        rest = data.replace("rloc_", "")
+        d, idx_str = rest.rsplit("_", 1)
+        idx = int(idx_str)
+        locations = compute_location_data(d)
+        if idx >= len(locations):
+            await query.edit_message_text(f"❌ Позицію не знайдено.")
+            return
+        item = locations[idx]
+        text = (
+            f"📍 {item['location']}\n\n"
+            f"⏱ Години: {format_hours(item['hours'])}\n"
+            f"👷 Кількість людей: {item['total_workers']}\n"
+            f"💸 Сума виплат: {int(item['paid_to_workers'])} грн\n"
+            f"💰 Дохід (за тарифом): {int(item['income'])} грн"
+        )
+        keyboard = [
+            [InlineKeyboardButton("⏱ Змінити години", callback_data=f"rf_{d}_{idx}_hours")],
+            [InlineKeyboardButton("👷 Змінити кількість людей", callback_data=f"rf_{d}_{idx}_workers")],
+            [InlineKeyboardButton("💸 Змінити суму виплат", callback_data=f"rf_{d}_{idx}_paid")],
+        ]
+        if item['edited']:
+            keyboard.append([InlineKeyboardButton("♻️ Скинути правки", callback_data=f"rreset_{d}_{idx}")])
+        keyboard.append([InlineKeyboardButton("◀️ До списку позицій", callback_data=f"redit_{d}")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("rf_"):
+        rest = data.replace("rf_", "")
+        d, idx_str, field = rest.rsplit("_", 2)
+        idx = int(idx_str)
+        locations = compute_location_data(d)
+        if idx >= len(locations):
+            await query.edit_message_text(f"❌ Позицію не знайдено.")
+            return
+        location = locations[idx]['location']
+        edit_state[query.from_user.id] = {"date": d, "location": location, "field": field, "idx": idx}
+        await query.edit_message_text(
+            f"📍 {location}\n\nВведіть нове значення для «{FIELD_LABELS[field]}»:"
+        )
+
+    elif data.startswith("rreset_"):
+        rest = data.replace("rreset_", "")
+        d, idx_str = rest.rsplit("_", 1)
+        idx = int(idx_str)
+        locations = compute_location_data(d)
+        if idx >= len(locations):
+            await query.edit_message_text(f"❌ Позицію не знайдено.")
+            return
+        location = locations[idx]['location']
+        reports_data.get(d, {}).get('overrides', {}).pop(location, None)
+        save_reports_data()
+        await query.edit_message_text(f"✅ Правки для '{location}' скинуто до початкових значень.")
 
 
 # ==================== MAIN ====================
