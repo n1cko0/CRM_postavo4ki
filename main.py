@@ -618,19 +618,21 @@ async def send_with_retry(bot, chat_id: int, text: str, parse_mode: str = None, 
     await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
 
 
-async def send_report_and_stats(bot, chat_id: int, report_date: str, reports: list, stats: dict):
-    for r in reports:
-        await send_with_retry(bot, chat_id, r)
+async def send_report_and_stats(bot, chat_id: int, report_date: str, reports: list, stats: dict, mode: str = "both"):
+    if mode in ("report", "both"):
+        for r in reports:
+            await send_with_retry(bot, chat_id, r)
+            await asyncio.sleep(0.3)
+
+        # службові повідомлення для логістів: за яку дату звіт і куди переказати оплату
+        await send_with_retry(bot, chat_id, f"ЗА {report_date}")
+        await asyncio.sleep(0.3)
+        await send_with_retry(bot, chat_id, MY_CARD_NUMBER)
         await asyncio.sleep(0.3)
 
-    # службові повідомлення для логістів: за яку дату звіт і куди переказати оплату
-    await send_with_retry(bot, chat_id, f"ЗА {report_date}")
-    await asyncio.sleep(0.3)
-    await send_with_retry(bot, chat_id, MY_CARD_NUMBER)
-    await asyncio.sleep(0.3)
-
-    # особистий підсумок — тільки для мене, останнім повідомленням
-    await send_with_retry(bot, chat_id, format_stats_message(report_date, stats), parse_mode="Markdown")
+    if mode in ("stats", "both"):
+        # особистий підсумок — тільки для мене
+        await send_with_retry(bot, chat_id, format_stats_message(report_date, stats), parse_mode="Markdown")
 
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1043,8 +1045,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not reports:
             await query.edit_message_text("❌ Немає даних для звіту.")
             return
-        await query.edit_message_text(f"✅ Звіт за {report_date}:")
-        await send_report_and_stats(context.bot, query.message.chat_id, report_date, reports, stats)
+        keyboard = [
+            [InlineKeyboardButton("📋 Тільки звіт", callback_data=f"show_{report_date}_report")],
+            [InlineKeyboardButton("📊 Тільки статистика", callback_data=f"show_{report_date}_stats")],
+            [InlineKeyboardButton("📋+📊 Все разом", callback_data=f"show_{report_date}_both")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data=f"show_{report_date}_cancel")],
+        ]
+        await query.edit_message_text(
+            f"Звіт за {report_date} готовий. Що показати?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     elif data == "rback":
         keyboard, dates = get_reports_list_keyboard()
@@ -1076,8 +1086,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not reports:
             await query.edit_message_text(f"❌ Немає даних для звіту за {d}.")
             return
-        await query.edit_message_text(f"✅ Звіт за {d}:")
-        await send_report_and_stats(context.bot, query.message.chat_id, d, reports, stats)
+        keyboard = [
+            [InlineKeyboardButton("📋 Тільки звіт", callback_data=f"show_{d}_report")],
+            [InlineKeyboardButton("📊 Тільки статистика", callback_data=f"show_{d}_stats")],
+            [InlineKeyboardButton("📋+📊 Все разом", callback_data=f"show_{d}_both")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data=f"show_{d}_cancel")],
+        ]
+        await query.edit_message_text(
+            f"Звіт за {d} готовий. Що показати?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     elif data.startswith("rdate_"):
         d = data.replace("rdate_", "")
@@ -1160,6 +1178,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reports_data.get(d, {}).get('overrides', {}).pop(location, None)
         save_reports_data()
         await query.edit_message_text(f"✅ Правки для '{location}' скинуто до початкових значень.")
+
+    elif data.startswith("show_"):
+        rest = data.replace("show_", "")
+        d, action = rest.rsplit("_", 1)
+
+        if action == "cancel":
+            await query.edit_message_text("Скасовано.")
+            return
+
+        reports, stats = build_report_and_stats(d)
+        if not reports:
+            await query.edit_message_text(f"❌ Немає даних для звіту за {d}.")
+            return
+
+        if action == "stats":
+            await query.edit_message_text(f"📊 Статистика за {d}:")
+        else:
+            await query.edit_message_text(f"✅ Звіт за {d}:")
+
+        await send_report_and_stats(context.bot, query.message.chat_id, d, reports, stats, mode=action)
 
 
 # ==================== MAIN ====================
