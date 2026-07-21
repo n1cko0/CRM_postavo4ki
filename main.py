@@ -450,17 +450,22 @@ def build_report_and_stats(report_date: str):
             # перше повідомлення для цієї локації мало (0) годин — беремо години з наступного блоку
             grouped[loc]['hours'] = block['hours']
 
+        # Скільки людей отримали гроші за цей блок:
+        # якщо є мітка "За N" — сума вже загальна на всіх N.
+        # якщо мітки немає — сума вказана ЗА ОДНУ картку, і карток може бути декілька.
+        if block['za_kilkokh'] > 0:
+            block_workers = block['za_kilkokh']
+            block_paid = block['raw_amount']
+        else:
+            block_workers = block['cards_count'] if block['cards_count'] > 0 else 1
+            block_paid = block['raw_amount'] * block_workers
+
         # (0) годин — це особиста доплата (наприклад водію), яка йде тільки в мінус,
         # але не рахується як офіційний вантажник для звіту логістам
         if block['hours'] > 0:
-            if block['za_kilkokh'] > 0:
-                grouped[loc]['total_workers'] += block['za_kilkokh']
-            elif block['cards_count'] > 0:
-                grouped[loc]['total_workers'] += block['cards_count']
-            else:
-                grouped[loc]['total_workers'] += 1
+            grouped[loc]['total_workers'] += block_workers
 
-        grouped[loc]['paid_to_workers'] += block['raw_amount']
+        grouped[loc]['paid_to_workers'] += block_paid
 
     # Формируем текст отчёта + собираем статистику по городам
     reports = []
