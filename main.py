@@ -380,9 +380,9 @@ def parse_workers_count(text: str):
     return mapping.get(text.strip().lower())
 
 
-def match_city(location: str, cities: dict):
-    """Шукає місто за точним співпадінням назви або явного синоніма
-    (тільки якщо location починається саме з цього слова)."""
+def match_city_detailed(location: str, cities: dict):
+    """Повертає (місто, суфікс) — суфікс це текст після назви міста/синоніма
+    (наприклад 'Велес' для 'Івано-Франківськ Велес')."""
     loc_lower = location.lower()
     index = build_city_index(cities)
     best_key = None
@@ -390,7 +390,18 @@ def match_city(location: str, cities: dict):
         if loc_lower.startswith(key):
             if best_key is None or len(key) > len(best_key):
                 best_key = key
-    return index[best_key] if best_key else None
+    if best_key is None:
+        return None, location
+    city = index[best_key]
+    suffix = location[len(best_key):].strip()
+    return city, (suffix if suffix else location)
+
+
+def match_city(location: str, cities: dict):
+    """Шукає місто за точним співпадінням назви або явного синоніма
+    (тільки якщо location починається саме з цього слова)."""
+    city, _ = match_city_detailed(location, cities)
+    return city
 
 
 def format_hours(hours: float) -> str:
@@ -491,7 +502,7 @@ def compute_location_data(report_date: str) -> list:
     result = []
     for loc in grouped_order:
         data = grouped[loc]
-        city = match_city(data['location'], cities)
+        city, sub_label = match_city_detailed(data['location'], cities)
         my_rate = cities.get(city, {}).get('rate', 0) if city else 0
         hours = data['hours']
         total_workers = data['total_workers']
@@ -500,6 +511,7 @@ def compute_location_data(report_date: str) -> list:
         result.append({
             'location': loc,
             'city': city,
+            'sub_label': sub_label,
             'hours': hours,
             'total_workers': total_workers,
             'paid_to_workers': data['paid_to_workers'],
@@ -550,9 +562,13 @@ def build_report_and_stats(report_date: str):
 
         city_key = city if city else loc
         if city_key not in city_stats:
-            city_stats[city_key] = {'paid': 0.0, 'income': 0.0}
+            city_stats[city_key] = {'paid': 0.0, 'income': 0.0, 'entries': []}
         city_stats[city_key]['paid'] += paid
         city_stats[city_key]['income'] += my_total
+        city_stats[city_key]['entries'].append({
+            'label': item['sub_label'],
+            'profit': my_total - paid,
+        })
 
     city_list = []
     for city_name, vals in city_stats.items():
@@ -562,10 +578,12 @@ def build_report_and_stats(report_date: str):
             'paid': vals['paid'],
             'income': vals['income'],
             'profit': profit,
+            'entries': vals['entries'],
         })
     city_list.sort(key=lambda x: x['profit'], reverse=True)
 
     stats = {
+        'total_deliveries': len(locations),
         'total_paid': total_paid,
         'total_income': total_income,
         'total_profit': total_income - total_paid,
@@ -581,6 +599,8 @@ def format_stats_message(report_date: str, stats: dict) -> str:
         return "❌ Немає даних для статистики."
 
     lines = [f"📊 *Статистика за {report_date}*", ""]
+    lines.append(f"*{stats['total_deliveries']} поставок*")
+    lines.append("")
     lines.append(f"💸 Заплачено вантажникам: {int(stats['total_paid'])} грн")
     lines.append(f"💰 Отримаю за роботу: {int(stats['total_income'])} грн")
 
@@ -597,6 +617,10 @@ def format_stats_message(report_date: str, stats: dict) -> str:
         lines.append("🏙 *Міста за прибутковістю:*")
         for i, c in enumerate(stats['cities'], start=1):
             lines.append(f"{i}. {c['city']} — {int(c['profit'])} грн")
+            if len(c['entries']) > 1:
+                for entry in c['entries']:
+                    sign = "+" if entry['profit'] >= 0 else ""
+                    lines.append(f"    • {entry['label']} — {sign}{int(entry['profit'])} грн")
 
     return "\n".join(lines)
 
