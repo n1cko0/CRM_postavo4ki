@@ -13,7 +13,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берём тільки з env
-SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
+FM_SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
+EKOL_SPREADSHEET_ID = os.environ.get("EKOL_SPREADSHEET_ID", "")  # поки не налаштовано
 CREDENTIALS_FILE = "credentials.json"
 
 # RAILWAY_VOLUME_MOUNT_PATH встановлюється Railway автоматично, якщо до сервісу
@@ -116,9 +117,19 @@ reports_data = load_reports_data()  # { "дд.мм.рррр": {"messages": [...]
 
 
 # ==================== GOOGLE SHEETS ====================
-def get_sheet_data():
+def get_sheet_data(source: str = "fm"):
     import base64
     import json as json_module
+
+    if source == "fm":
+        spreadsheet_id = FM_SPREADSHEET_ID
+    elif source == "ekol":
+        spreadsheet_id = EKOL_SPREADSHEET_ID
+    else:
+        raise ValueError(f"Невідоме джерело: {source}")
+
+    if not spreadsheet_id:
+        raise ValueError(f"Таблиця для '{source}' ще не налаштована (немає SPREADSHEET_ID)")
 
     google_creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_B64")
     google_creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -135,9 +146,9 @@ def get_sheet_data():
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
 
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    spreadsheet = client.open_by_key(spreadsheet_id)
     last_sheet = spreadsheet.worksheets()[-1]
-    logger.info(f"Читаємо лист: {last_sheet.title}")
+    logger.info(f"Читаємо лист ({source}): {last_sheet.title}")
 
     all_values = last_sheet.get_all_values()
     sheet_id = last_sheet.id
@@ -709,45 +720,25 @@ def get_reports_list_keyboard():
 
 
 # ==================== ВІДПРАВКА ПОСТАВОК ====================
-async def send_deliveries_msg(update: Update, context: ContextTypes.DEFAULT_TYPE, filter_date: date = None):
-    chat_id = update.effective_chat.id
-    bot = context.bot
-    await send_with_retry(bot, chat_id, "⏳ Завантажую дані з таблиці...")
-    try:
-        all_values, merged_cells = get_sheet_data()
-        routes = parse_routes(all_values, merged_cells)
-        messages = build_delivery_messages(routes, merged_cells, filter_date=filter_date)
-
-        if not messages:
-            date_info = filter_date.strftime("%d.%m.%Y") if filter_date else ""
-            await send_with_retry(
-                bot, chat_id,
-                f"❌ Поставок {'на ' + date_info if date_info else ''} не знайдено."
-            )
-            return
-
-        date_info = filter_date.strftime("%d.%m.%Y") if filter_date else "всі"
-        await send_with_retry(
-            bot, chat_id,
-            f"✅ Знайдено поставок: *{len(messages)}* (дата: {date_info})",
-            parse_mode="Markdown"
-        )
-
-        for msg_data in messages:
-            await send_with_retry(bot, chat_id, msg_data["text"], parse_mode="Markdown")
-            await asyncio.sleep(0.35)
-
-    except Exception as e:
-        logger.error(f"Помилка: {e}", exc_info=True)
-        await send_with_retry(bot, chat_id, f"❌ Помилка: {str(e)}")
+SOURCE_EMOJI = {"fm": "🔴", "ekol": "🔵"}
+SOURCE_LABEL = {"fm": "FM", "ekol": "Ekol"}
 
 
-async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, filter_date: date = None):
+async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, source: str = "fm", filter_date: date = None):
     chat_id = query.message.chat_id
     bot = context.bot
-    await query.edit_message_text("⏳ Завантажую дані з таблиці...")
+    emoji = SOURCE_EMOJI.get(source, "")
+    label = SOURCE_LABEL.get(source, source)
+    await query.edit_message_text(f"⏳ {emoji} Завантажую дані з таблиці {label}...")
     try:
-        all_values, merged_cells = get_sheet_data()
+        if source == "ekol":
+            await send_with_retry(
+                bot, chat_id,
+                f"{emoji} Парсинг таблиці Ekol ще не реалізовано. Скоро додамо!"
+            )
+            return
+
+        all_values, merged_cells = get_sheet_data(source=source)
         routes = parse_routes(all_values, merged_cells)
         messages = build_delivery_messages(routes, merged_cells, filter_date=filter_date)
 
@@ -755,14 +746,14 @@ async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, filte
             date_info = filter_date.strftime("%d.%m.%Y") if filter_date else ""
             await send_with_retry(
                 bot, chat_id,
-                f"❌ Поставок {'на ' + date_info if date_info else ''} не знайдено."
+                f"❌ {emoji} Поставок {label} {'на ' + date_info if date_info else ''} не знайдено."
             )
             return
 
         date_info = filter_date.strftime("%d.%m.%Y") if filter_date else "всі"
         await send_with_retry(
             bot, chat_id,
-            f"✅ Знайдено поставок: *{len(messages)}* (дата: {date_info})",
+            f"✅ {emoji} {label}: знайдено поставок *{len(messages)}* (дата: {date_info})",
             parse_mode="Markdown"
         )
 
@@ -955,13 +946,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📦 Поставки":
         keyboard = [
-            [InlineKeyboardButton("📋 Всі поставки", callback_data="dlv_all")],
-            [InlineKeyboardButton("📅 На сьогодні", callback_data="dlv_today")],
-            [InlineKeyboardButton("📅 На завтра", callback_data="dlv_tomorrow")],
-            [InlineKeyboardButton("🔢 На конкретну дату", callback_data="dlv_pick")],
+            [InlineKeyboardButton("🔴 FM", callback_data="dlvsrc_fm")],
+            [InlineKeyboardButton("🔵 Ekol", callback_data="dlvsrc_ekol")],
         ]
         await update.message.reply_text(
-            "Обери що показати:",
+            "Оберіть таблицю:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     elif text == "🏙 Мої міста":
@@ -996,28 +985,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "dlv_all":
-        await send_deliveries_query(query, context, filter_date=None)
+    if data.startswith("dlvsrc_"):
+        source = data.replace("dlvsrc_", "")
+        label = SOURCE_LABEL.get(source, source)
+        emoji = SOURCE_EMOJI.get(source, "")
+        keyboard = [
+            [InlineKeyboardButton("📋 Всі поставки", callback_data=f"dlv_all_{source}")],
+            [InlineKeyboardButton("📅 На сьогодні", callback_data=f"dlv_today_{source}")],
+            [InlineKeyboardButton("📅 На завтра", callback_data=f"dlv_tomorrow_{source}")],
+            [InlineKeyboardButton("🔢 На конкретну дату", callback_data=f"dlv_pick_{source}")],
+        ]
+        await query.edit_message_text(
+            f"{emoji} {label}. Обери що показати:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-    elif data == "dlv_today":
-        await send_deliveries_query(query, context, filter_date=date.today())
+    elif data.startswith("dlv_all_"):
+        source = data.replace("dlv_all_", "")
+        await send_deliveries_query(query, context, source=source, filter_date=None)
 
-    elif data == "dlv_tomorrow":
-        await send_deliveries_query(query, context, filter_date=date.today() + timedelta(days=1))
+    elif data.startswith("dlv_today_"):
+        source = data.replace("dlv_today_", "")
+        await send_deliveries_query(query, context, source=source, filter_date=date.today())
 
-    elif data == "dlv_pick":
+    elif data.startswith("dlv_tomorrow_"):
+        source = data.replace("dlv_tomorrow_", "")
+        await send_deliveries_query(query, context, source=source, filter_date=date.today() + timedelta(days=1))
+
+    elif data.startswith("dlv_pick_"):
+        source = data.replace("dlv_pick_", "")
         keyboard = []
         for i in range(7):
             d = date.today() + timedelta(days=i)
             label = d.strftime("%d.%m.%Y")
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{label}")])
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{label}_{source}")])
         await query.edit_message_text("Оберіть дату:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("date_"):
-        date_str = data.replace("date_", "")
+        rest = data.replace("date_", "")
+        date_str, source = rest.rsplit("_", 1)
         try:
             filter_date = datetime.strptime(date_str, "%d.%m.%Y").date()
-            await send_deliveries_query(query, context, filter_date=filter_date)
+            await send_deliveries_query(query, context, source=source, filter_date=filter_date)
         except ValueError:
             await query.edit_message_text("Помилка дати")
 
