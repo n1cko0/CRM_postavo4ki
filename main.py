@@ -47,6 +47,14 @@ logger = logging.getLogger(__name__)
 
 current_report_date = {}
 edit_state = {}  # user_id -> {"date": ..., "location": ..., "field": "hours"|"workers"|"paid"}
+worker_flow_state = {}  # user_id -> {"mode": "add_name"|"add_phone"|"add_username"|"add_card"|"edit_field", ...}
+
+WORKER_FIELD_LABELS = {
+    "name": "ім'я",
+    "phone": "телефон",
+    "username": "username в Telegram (без @)",
+    "card": "номер картки",
+}
 
 FIELD_LABELS = {
     "hours": "години",
@@ -61,7 +69,7 @@ FIELD_TO_OVERRIDE_KEY = {
 
 # Тексты кнопок Reply Keyboard — их нельзя перехватывать как оплату/карту в группе
 BUTTON_TEXTS = {
-    "📦 Поставки", "🏙 Мої міста", "📊 Звіт", "🗂 Мої звіти",
+    "📦 Поставки", "🏙 Мої міста", "📊 Звіт", "🗂 Мої звіти", "👷 Робітники",
 }
 
 
@@ -96,6 +104,16 @@ def init_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_payment_messages_date ON payment_messages(report_date)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS workers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT,
+            username TEXT,
+            card_number TEXT,
+            created_at TEXT
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS report_overrides (
             report_date TEXT NOT NULL,
@@ -301,6 +319,65 @@ def db_delete_override(report_date: str, location: str):
         "DELETE FROM report_overrides WHERE report_date = ? AND location = ?",
         (report_date, location)
     )
+    conn.commit()
+    conn.close()
+
+
+# ==================== РОБІТНИКИ ====================
+def db_add_worker(name: str, phone: str = "", username: str = "", card: str = "") -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO workers (name, phone, username, card_number, created_at) VALUES (?, ?, ?, ?, ?)",
+        (name, phone, username, card, datetime.now().isoformat())
+    )
+    conn.commit()
+    worker_id = cur.lastrowid
+    conn.close()
+    return worker_id
+
+
+UA_ALPHABET = "абвгґдеєжзиіїйклмнопрстуфхцчшщьюя"
+
+
+def ua_sort_key(name: str):
+    name = name.lower()
+    return [UA_ALPHABET.index(c) if c in UA_ALPHABET else 1000 + ord(c) for c in name]
+
+
+def db_get_workers() -> list:
+    conn = get_conn()
+    rows = conn.execute("SELECT id, name, phone, username, card_number FROM workers").fetchall()
+    conn.close()
+    workers = [
+        {"id": r["id"], "name": r["name"], "phone": r["phone"] or "", "username": r["username"] or "", "card": r["card_number"] or ""}
+        for r in rows
+    ]
+    workers.sort(key=lambda w: ua_sort_key(w["name"]))
+    return workers
+
+
+def db_get_worker(worker_id: int):
+    conn = get_conn()
+    r = conn.execute("SELECT id, name, phone, username, card_number FROM workers WHERE id = ?", (worker_id,)).fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {"id": r["id"], "name": r["name"], "phone": r["phone"] or "", "username": r["username"] or "", "card": r["card_number"] or ""}
+
+
+def db_update_worker(worker_id: int, field: str, value: str):
+    column = {"name": "name", "phone": "phone", "username": "username", "card": "card_number"}.get(field)
+    if not column:
+        raise ValueError(f"Невідоме поле працівника: {field}")
+    conn = get_conn()
+    conn.execute(f"UPDATE workers SET {column} = ? WHERE id = ?", (value, worker_id))
+    conn.commit()
+    conn.close()
+
+
+def db_delete_worker(worker_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
     conn.commit()
     conn.close()
 
@@ -952,6 +1029,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = msg.from_user.id
     if user_id in edit_state:
         return  # це введення нового значення при редагуванні позиції, а не оплата
+    if user_id in worker_flow_state:
+        return  # це введення даних працівника, а не оплата
     if user_id not in current_report_date:
         return
 
@@ -968,7 +1047,7 @@ def get_main_keyboard():
         [
             ["📦 Поставки"],
             ["🏙 Мої міста", "📊 Звіт"],
-            ["🗂 Мої звіти"],
+            ["🗂 Мої звіти", "👷 Робітники"],
         ],
         resize_keyboard=True
     )
@@ -978,6 +1057,40 @@ def get_reports_list_keyboard():
     dates = db_list_report_dates()
     keyboard = [[InlineKeyboardButton(d, callback_data=f"rdate_{d}")] for d in dates]
     return keyboard, dates
+
+
+def get_workers_list_keyboard():
+    workers = db_get_workers()
+    keyboard = [[InlineKeyboardButton(w["name"] or f"#{w['id']}", callback_data=f"wview_{w['id']}")] for w in workers]
+    keyboard.append([InlineKeyboardButton("➕ Додати працівника", callback_data="waddnew")])
+    return keyboard, workers
+
+
+def format_worker_card(w: dict) -> str:
+    lines = [f"👷 *{w['name']}*"]
+    if w["phone"]:
+        lines.append(f"📞 {w['phone']}")
+    if w["username"]:
+        lines.append(f"💬 @{w['username']}")
+    if w["card"]:
+        lines.append(f"💳 {w['card']}")
+    return "\n".join(lines)
+
+
+def get_worker_card_keyboard(worker_id: int) -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Ім'я", callback_data=f"wf_{worker_id}_name"),
+            InlineKeyboardButton("✏️ Телефон", callback_data=f"wf_{worker_id}_phone"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Username", callback_data=f"wf_{worker_id}_username"),
+            InlineKeyboardButton("✏️ Картка", callback_data=f"wf_{worker_id}_card"),
+        ],
+        [InlineKeyboardButton("🗑 Видалити", callback_data=f"wdel_{worker_id}")],
+        [InlineKeyboardButton("◀️ До списку", callback_data="wback")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ==================== ВІДПРАВКА ПОСТАВОК ====================
@@ -1148,6 +1261,59 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
+    if user_id in worker_flow_state:
+        state = worker_flow_state[user_id]
+        raw = update.message.text.strip()
+        mode = state["mode"]
+
+        if mode == "add_name":
+            if not raw:
+                await update.message.reply_text("❌ Ім'я не може бути порожнім. Введіть ім'я:")
+                return
+            state["data"]["name"] = raw
+            state["mode"] = "add_phone"
+            await update.message.reply_text("Телефон (або «-», щоб пропустити):")
+            return
+
+        if mode == "add_phone":
+            state["data"]["phone"] = "" if raw == "-" else raw
+            state["mode"] = "add_username"
+            await update.message.reply_text("Username в Telegram без @ (або «-», щоб пропустити):")
+            return
+
+        if mode == "add_username":
+            state["data"]["username"] = "" if raw == "-" else raw.lstrip("@")
+            state["mode"] = "add_card"
+            await update.message.reply_text("Номер картки (або «-», щоб пропустити):")
+            return
+
+        if mode == "add_card":
+            state["data"]["card"] = "" if raw == "-" else raw
+            worker_id = db_add_worker(**state["data"])
+            del worker_flow_state[user_id]
+            w = db_get_worker(worker_id)
+            await update.message.reply_text(
+                f"✅ Додано працівника:\n\n{format_worker_card(w)}",
+                parse_mode="Markdown",
+                reply_markup=get_worker_card_keyboard(worker_id)
+            )
+            return
+
+        if mode == "edit_field":
+            worker_id = state["worker_id"]
+            field = state["field"]
+            value = "" if raw == "-" else (raw.lstrip("@") if field == "username" else raw)
+            db_update_worker(worker_id, field, value)
+            del worker_flow_state[user_id]
+            w = db_get_worker(worker_id)
+            if w:
+                await update.message.reply_text(
+                    f"✅ Оновлено.\n\n{format_worker_card(w)}",
+                    parse_mode="Markdown",
+                    reply_markup=get_worker_card_keyboard(worker_id)
+                )
+            return
+
     if user_id in edit_state:
         state = edit_state[user_id]
         text_input = update.message.text.strip().replace(',', '.')
@@ -1226,6 +1392,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Оберіть дату звіту:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+
+    elif text == "👷 Робітники":
+        keyboard, workers = get_workers_list_keyboard()
+        msg = "Робітники:" if workers else "❌ Поки немає жодного працівника."
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 # ==================== CALLBACK HANDLER ====================
@@ -1465,6 +1636,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"✅ Звіт за {d}:")
 
         await send_report_and_stats(context.bot, query.message.chat_id, d, reports, stats, mode=action)
+
+    elif data == "waddnew":
+        worker_flow_state[query.from_user.id] = {"mode": "add_name", "data": {}}
+        await query.edit_message_text("Введіть ім'я нового працівника:")
+
+    elif data == "wback":
+        keyboard, workers = get_workers_list_keyboard()
+        msg = "Робітники:" if workers else "❌ Поки немає жодного працівника."
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("wdelconfirm_"):
+        worker_id = int(data.replace("wdelconfirm_", ""))
+        db_delete_worker(worker_id)
+        keyboard, workers = get_workers_list_keyboard()
+        msg = "✅ Видалено.\n\n" + ("Робітники:" if workers else "Поки немає жодного працівника.")
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("wdel_"):
+        worker_id = int(data.replace("wdel_", ""))
+        keyboard = [
+            [InlineKeyboardButton("✅ Так, видалити", callback_data=f"wdelconfirm_{worker_id}")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data=f"wview_{worker_id}")],
+        ]
+        await query.edit_message_text("Видалити цього працівника?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("wf_"):
+        rest = data.replace("wf_", "")
+        worker_id_str, field = rest.rsplit("_", 1)
+        worker_id = int(worker_id_str)
+        worker_flow_state[query.from_user.id] = {"mode": "edit_field", "worker_id": worker_id, "field": field}
+        await query.edit_message_text(f"Введіть нове значення для «{WORKER_FIELD_LABELS[field]}» (або «-», щоб очистити):")
+
+    elif data.startswith("wview_"):
+        worker_id = int(data.replace("wview_", ""))
+        w = db_get_worker(worker_id)
+        if not w:
+            await query.edit_message_text("❌ Працівника не знайдено.")
+            return
+        await query.edit_message_text(
+            format_worker_card(w),
+            parse_mode="Markdown",
+            reply_markup=get_worker_card_keyboard(worker_id)
+        )
 
 
 # ==================== MAIN ====================
