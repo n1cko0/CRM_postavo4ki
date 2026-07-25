@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import difflib
 import json
 import os
 import sqlite3
@@ -55,6 +56,7 @@ WORKER_FIELD_LABELS = {
     "phone": "телефон",
     "username": "username в Telegram (без @)",
     "card": "номер картки",
+    "city": "місто",
 }
 
 FIELD_LABELS = {
@@ -118,6 +120,8 @@ def init_db():
     worker_cols = [r["name"] for r in conn.execute("PRAGMA table_info(workers)")]
     if "telegram_id" not in worker_cols:
         conn.execute("ALTER TABLE workers ADD COLUMN telegram_id INTEGER")
+    if "city" not in worker_cols:
+        conn.execute("ALTER TABLE workers ADD COLUMN city TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_contacts (
             telegram_id INTEGER PRIMARY KEY,
@@ -129,10 +133,14 @@ def init_db():
             full_name_ua TEXT,
             age TEXT,
             phone TEXT,
+            city_raw TEXT,
             anketa_completed_at TEXT,
             converted_to_worker_id INTEGER
         )
     """)
+    contact_cols = [r["name"] for r in conn.execute("PRAGMA table_info(bot_contacts)")]
+    if "city_raw" not in contact_cols:
+        conn.execute("ALTER TABLE bot_contacts ADD COLUMN city_raw TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS report_overrides (
             report_date TEXT NOT NULL,
@@ -343,11 +351,11 @@ def db_delete_override(report_date: str, location: str):
 
 
 # ==================== РОБІТНИКИ ====================
-def db_add_worker(name: str, phone: str = "", username: str = "", card: str = "", telegram_id: int = None) -> int:
+def db_add_worker(name: str, phone: str = "", username: str = "", card: str = "", telegram_id: int = None, city: str = "") -> int:
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO workers (name, phone, username, card_number, telegram_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (name, phone, username, card, telegram_id, datetime.now().isoformat())
+        "INSERT INTO workers (name, phone, username, card_number, telegram_id, city, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (name, phone, username, card, telegram_id, city, datetime.now().isoformat())
     )
     conn.commit()
     worker_id = cur.lastrowid
@@ -365,13 +373,13 @@ def ua_sort_key(name: str):
 
 def db_get_workers() -> list:
     conn = get_conn()
-    rows = conn.execute("SELECT id, name, phone, username, card_number, telegram_id FROM workers").fetchall()
+    rows = conn.execute("SELECT id, name, phone, username, card_number, telegram_id, city FROM workers").fetchall()
     conn.close()
     workers = [
         {
             "id": r["id"], "name": r["name"], "phone": r["phone"] or "",
             "username": r["username"] or "", "card": r["card_number"] or "",
-            "telegram_id": r["telegram_id"],
+            "telegram_id": r["telegram_id"], "city": r["city"] or "",
         }
         for r in rows
     ]
@@ -382,7 +390,7 @@ def db_get_workers() -> list:
 def db_get_worker(worker_id: int):
     conn = get_conn()
     r = conn.execute(
-        "SELECT id, name, phone, username, card_number, telegram_id FROM workers WHERE id = ?",
+        "SELECT id, name, phone, username, card_number, telegram_id, city FROM workers WHERE id = ?",
         (worker_id,)
     ).fetchone()
     conn.close()
@@ -391,12 +399,12 @@ def db_get_worker(worker_id: int):
     return {
         "id": r["id"], "name": r["name"], "phone": r["phone"] or "",
         "username": r["username"] or "", "card": r["card_number"] or "",
-        "telegram_id": r["telegram_id"],
+        "telegram_id": r["telegram_id"], "city": r["city"] or "",
     }
 
 
 def db_update_worker(worker_id: int, field: str, value: str):
-    column = {"name": "name", "phone": "phone", "username": "username", "card": "card_number"}.get(field)
+    column = {"name": "name", "phone": "phone", "username": "username", "card": "card_number", "city": "city"}.get(field)
     if not column:
         raise ValueError(f"Невідоме поле працівника: {field}")
     conn = get_conn()
@@ -436,8 +444,11 @@ def db_touch_contact(user):
 def db_save_anketa(telegram_id: int, data: dict):
     conn = get_conn()
     conn.execute(
-        "UPDATE bot_contacts SET full_name_ua=?, age=?, phone=?, anketa_completed_at=? WHERE telegram_id=?",
-        (data.get("full_name", ""), data.get("age", ""), data.get("phone", ""), datetime.now().isoformat(), telegram_id)
+        "UPDATE bot_contacts SET full_name_ua=?, age=?, phone=?, city_raw=?, anketa_completed_at=? WHERE telegram_id=?",
+        (
+            data.get("full_name", ""), data.get("age", ""), data.get("phone", ""),
+            data.get("city", ""), datetime.now().isoformat(), telegram_id
+        )
     )
     conn.commit()
     conn.close()
@@ -845,6 +856,38 @@ def match_city(location: str, cities: dict):
     return city
 
 
+def guess_city(raw: str, cities: dict) -> str:
+    """Найкраще припущення, яке місто мав на увазі користувач у вільному тексті
+    (наприклад "Ивано-Франковск", "ІФ", "ИФ", "і-ф"). Це лише підказка —
+    не використовується ніде в фінансових розрахунках, тільки для довідки."""
+    if not raw or not raw.strip():
+        return ""
+
+    text = normalize_apostrophes(raw.strip().lower())
+    index = build_city_index(cities)
+
+    # 1) точне співпадіння з назвою чи синонімом
+    if text in index:
+        return index[text]
+
+    # 2) абревіатура: "ІФ" / "ИФ" / "і-ф" -> перші літери слів "Івано-Франківськ"
+    translit = str.maketrans({"и": "і", "ы": "і"})
+    letters_only = re.sub(r"[^а-яіїєґ]", "", text.translate(translit))
+    if letters_only:
+        for city_name in cities.keys():
+            parts = re.split(r"[ \-]", city_name.lower().translate(translit))
+            initials = "".join(p[0] for p in parts if p)
+            if letters_only == initials:
+                return city_name
+
+    # 3) нечітке співпадіння (одруківки, транслітерація)
+    close = difflib.get_close_matches(text, list(index.keys()), n=1, cutoff=0.6)
+    if close:
+        return index[close[0]]
+
+    return ""
+
+
 def format_hours(hours: float) -> str:
     if hours == int(hours):
         return str(int(hours))
@@ -1170,6 +1213,11 @@ def format_candidate_card(c: dict) -> str:
         lines.append(f"📞 {c['phone']}")
     if c.get("username"):
         lines.append(f"💬 @{c['username']}")
+    if c.get("city_raw"):
+        lines.append(f"📍 Місто (як написав): {c['city_raw']}")
+        guess = guess_city(c["city_raw"], load_cities())
+        if guess and guess.lower() != c["city_raw"].strip().lower():
+            lines.append(f"   ймовірно: {guess}")
     lines.append(f"🆔 {c['telegram_id']}")
     return "\n".join(lines)
 
@@ -1178,6 +1226,8 @@ def format_worker_card(w: dict) -> str:
     lines = [f"👷 *{w['name']}*"]
     if w["phone"]:
         lines.append(f"📞 {w['phone']}")
+    if w.get("city"):
+        lines.append(f"📍 {w['city']}")
     if w["username"]:
         lines.append(f"💬 @{w['username']}")
     if w["card"]:
@@ -1201,9 +1251,10 @@ def get_worker_card_keyboard(worker_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Телефон", callback_data=f"wf_{worker_id}_phone"),
         ],
         [
+            InlineKeyboardButton("✏️ Місто", callback_data=f"wf_{worker_id}_city"),
             InlineKeyboardButton("✏️ Username", callback_data=f"wf_{worker_id}_username"),
-            InlineKeyboardButton("✏️ Картка", callback_data=f"wf_{worker_id}_card"),
         ],
+        [InlineKeyboardButton("✏️ Картка", callback_data=f"wf_{worker_id}_card")],
         [InlineKeyboardButton("🗑 Видалити", callback_data=f"wdel_{worker_id}")],
         [InlineKeyboardButton("◀️ До списку", callback_data="wback")],
     ]
@@ -1279,6 +1330,7 @@ async def notify_admins_new_contact(bot, user, data: dict):
         f"Прізвище та ім'я: {data.get('full_name', '—')}\n"
         f"Вік: {data.get('age', '—')}\n"
         f"Телефон: {data.get('phone', '—')}\n"
+        f"Місто (як написав): {data.get('city', '—')}\n"
         f"Telegram: {'@' + user.username if user.username else '(немає username)'}\n"
         f"ID: {user.id}"
     )
@@ -1312,6 +1364,12 @@ async def handle_anketa_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if step == "phone":
         state["data"]["phone"] = raw
+        state["step"] = "city"
+        await update.message.reply_text("З якого ви міста?")
+        return
+
+    if step == "city":
+        state["data"]["city"] = raw
         db_save_anketa(user.id, state["data"])
         del anketa_state[user.id]
         await update.message.reply_text("✅ Дякую! Ми зв'яжемося з вами за потреби.")
@@ -1893,6 +1951,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone=c.get("phone") or "",
             username=c.get("username") or "",
             telegram_id=telegram_id,
+            city=c.get("city_raw") or "",
         )
         db_mark_converted(telegram_id, worker_id)
         w = db_get_worker(worker_id)
