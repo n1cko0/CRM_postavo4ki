@@ -27,6 +27,11 @@ ALLOWED_USERS = [7305470549, 506094120]
 REPORT_GROUP_ID = -5344273524
 MY_CARD_NUMBER = "4441111134286644"
 
+# Міста, які треба виключити саме з парсингу FM (наприклад через однойменне
+# але зовсім інше місто в тій же колонці "Місто" — реальний Миколаїв ведеться
+# тільки через Ekol, а в FM під цією ж назвою трапляється Миколаїв Львівської області)
+FM_EXCLUDED_CITIES = {"Миколаїв"}
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -224,7 +229,8 @@ def parse_routes(all_values: list, merged_cells: list) -> list:
 
 def build_delivery_messages(routes: list, merged_cells: list, filter_date: date = None) -> list:
     cities = load_cities()
-    my_cities = {c.lower() for c in cities.keys()}
+    excluded = {c.lower() for c in FM_EXCLUDED_CITIES}
+    my_cities = {c.lower() for c in cities.keys()} - excluded
     messages = []
 
     for route in routes:
