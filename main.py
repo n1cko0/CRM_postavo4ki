@@ -3,6 +3,7 @@ import logging
 import re
 import json
 import os
+import sqlite3
 from datetime import datetime, date, timedelta
 
 import gspread
@@ -21,8 +22,9 @@ CREDENTIALS_FILE = "credentials.json"
 # прикріплено Volume. Локально (в PyCharm) цієї змінної немає — тоді файли
 # зберігаються поруч зі скриптом, як і раніше.
 DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".")
-CITIES_FILE = os.path.join(DATA_DIR, "cities.json")
-REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")
+CITIES_FILE = os.path.join(DATA_DIR, "cities.json")       # тільки для одноразової міграції
+REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")     # тільки для одноразової міграції
+DB_FILE = os.path.join(DATA_DIR, "postavo4ki.db")
 ALLOWED_USERS = [7305470549, 506094120]
 REPORT_GROUP_ID = -5344273524
 MY_CARD_NUMBER = "4441111134286644"
@@ -63,35 +65,145 @@ BUTTON_TEXTS = {
 }
 
 
+# ==================== SQLITE ====================
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cities (
+            name TEXT PRIMARY KEY,
+            rate INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS city_aliases (
+            alias TEXT PRIMARY KEY,
+            city_name TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS payment_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_date TEXT NOT NULL,
+            text TEXT NOT NULL,
+            timestamp TEXT,
+            message_id INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_payment_messages_date ON payment_messages(report_date)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS report_overrides (
+            report_date TEXT NOT NULL,
+            location TEXT NOT NULL,
+            hours REAL,
+            total_workers INTEGER,
+            paid_to_workers REAL,
+            PRIMARY KEY (report_date, location)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def migrate_json_to_db():
+    """Одноразово переносить дані зі старих cities.json / reports.json у SQLite,
+    якщо відповідні таблиці ще порожні. Самі JSON-файли не видаляються — лежать як бекап."""
+    conn = get_conn()
+
+    cities_count = conn.execute("SELECT COUNT(*) AS c FROM cities").fetchone()["c"]
+    if cities_count == 0 and os.path.exists(CITIES_FILE):
+        try:
+            with open(CITIES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for name, info in data.items():
+                if isinstance(info, (int, float)):
+                    rate, aliases = info, []
+                else:
+                    rate, aliases = info.get("rate", 0), info.get("aliases", [])
+                conn.execute("INSERT OR IGNORE INTO cities (name, rate) VALUES (?, ?)", (name, rate))
+                for alias in aliases:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO city_aliases (alias, city_name) VALUES (?, ?)",
+                        (alias, name)
+                    )
+            conn.commit()
+            logger.info(f"Мігровано {len(data)} міст з cities.json у SQLite")
+        except Exception as e:
+            logger.error(f"Помилка міграції cities.json: {e}", exc_info=True)
+
+    messages_count = conn.execute("SELECT COUNT(*) AS c FROM payment_messages").fetchone()["c"]
+    if messages_count == 0 and os.path.exists(REPORTS_FILE):
+        try:
+            with open(REPORTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            total = 0
+            for report_date, session in data.items():
+                for msg in session.get("messages", []):
+                    conn.execute(
+                        "INSERT INTO payment_messages (report_date, text, timestamp, message_id) VALUES (?, ?, ?, ?)",
+                        (report_date, msg.get("text", ""), msg.get("timestamp"), msg.get("message_id"))
+                    )
+                    total += 1
+                for location, ov in session.get("overrides", {}).items():
+                    conn.execute(
+                        """INSERT INTO report_overrides (report_date, location, hours, total_workers, paid_to_workers)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (report_date, location, ov.get("hours"), ov.get("total_workers"), ov.get("paid_to_workers"))
+                    )
+            conn.commit()
+            logger.info(f"Мігровано {total} повідомлень з reports.json у SQLite")
+        except Exception as e:
+            logger.error(f"Помилка міграції reports.json: {e}", exc_info=True)
+
+    conn.close()
+
+
 # ==================== МІСТА ====================
 def load_cities() -> dict:
-    """Формат: {"Назва": {"rate": 200, "aliases": ["Скорочення", ...]}}.
-    Старий плоский формат {"Назва": 200} мігрується автоматично."""
-    if not os.path.exists(CITIES_FILE):
-        return {}
-
-    with open(CITIES_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    migrated = False
-    for name, info in list(data.items()):
-        if isinstance(info, (int, float)):
-            data[name] = {"rate": info, "aliases": []}
-            migrated = True
-        elif isinstance(info, dict) and "aliases" not in info:
-            info["aliases"] = []
-            migrated = True
-
-    if migrated:
-        with open(CITIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    return data
+    """Формат: {"Назва": {"rate": 200, "aliases": ["Скорочення", ...]}}"""
+    conn = get_conn()
+    cities = {}
+    for row in conn.execute("SELECT name, rate FROM cities"):
+        cities[row["name"]] = {"rate": row["rate"], "aliases": []}
+    for row in conn.execute("SELECT alias, city_name FROM city_aliases"):
+        if row["city_name"] in cities:
+            cities[row["city_name"]]["aliases"].append(row["alias"])
+    conn.close()
+    return cities
 
 
 def save_cities(cities: dict):
-    with open(CITIES_FILE, "w", encoding="utf-8") as f:
-        json.dump(cities, f, ensure_ascii=False, indent=2)
+    """Повністю синхронізує таблиці cities/city_aliases зі станом переданого словника."""
+    conn = get_conn()
+    existing = {row["name"] for row in conn.execute("SELECT name FROM cities")}
+    incoming = set(cities.keys())
+
+    for name in existing - incoming:
+        conn.execute("DELETE FROM city_aliases WHERE city_name = ?", (name,))
+        conn.execute("DELETE FROM cities WHERE name = ?", (name,))
+
+    for name, info in cities.items():
+        rate = info.get("rate", 0) if isinstance(info, dict) else info
+        aliases = info.get("aliases", []) if isinstance(info, dict) else []
+        conn.execute(
+            "INSERT INTO cities (name, rate) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET rate=excluded.rate",
+            (name, rate)
+        )
+        conn.execute("DELETE FROM city_aliases WHERE city_name = ?", (name,))
+        for alias in aliases:
+            conn.execute(
+                "INSERT OR REPLACE INTO city_aliases (alias, city_name) VALUES (?, ?)",
+                (alias, name)
+            )
+
+    conn.commit()
+    conn.close()
 
 
 def build_city_index(cities: dict) -> dict:
@@ -105,20 +217,96 @@ def build_city_index(cities: dict) -> dict:
     return index
 
 
-# ==================== ЗБЕРЕЖЕННЯ ЗВІТІВ (переживає рестарт бота) ====================
-def load_reports_data() -> dict:
-    if os.path.exists(REPORTS_FILE):
-        with open(REPORTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+# ==================== ЗВІТИ (сирі повідомлення про оплату + ручні правки) ====================
+def db_add_message(report_date: str, text: str, timestamp: str, message_id: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO payment_messages (report_date, text, timestamp, message_id) VALUES (?, ?, ?, ?)",
+        (report_date, text, timestamp, message_id)
+    )
+    conn.commit()
+    conn.close()
 
 
-def save_reports_data():
-    with open(REPORTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(reports_data, f, ensure_ascii=False, indent=2)
+def db_get_messages(report_date: str) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT text, timestamp, message_id FROM payment_messages WHERE report_date = ? ORDER BY id",
+        (report_date,)
+    ).fetchall()
+    conn.close()
+    return [{"text": r["text"], "timestamp": r["timestamp"], "message_id": r["message_id"]} for r in rows]
 
 
-reports_data = load_reports_data()  # { "дд.мм.рррр": {"messages": [...]} }
+def db_list_report_dates() -> list:
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT report_date FROM payment_messages
+        UNION
+        SELECT report_date FROM report_overrides
+    """).fetchall()
+    conn.close()
+    dates = {r["report_date"] for r in rows}
+    return sorted(dates, key=lambda d: datetime.strptime(d, "%d.%m.%Y"), reverse=True)
+
+
+def db_delete_report(report_date: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM payment_messages WHERE report_date = ?", (report_date,))
+    conn.execute("DELETE FROM report_overrides WHERE report_date = ?", (report_date,))
+    conn.commit()
+    conn.close()
+
+
+def db_get_overrides(report_date: str) -> dict:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT location, hours, total_workers, paid_to_workers FROM report_overrides WHERE report_date = ?",
+        (report_date,)
+    ).fetchall()
+    conn.close()
+    overrides = {}
+    for r in rows:
+        ov = {}
+        if r["hours"] is not None:
+            ov["hours"] = r["hours"]
+        if r["total_workers"] is not None:
+            ov["total_workers"] = r["total_workers"]
+        if r["paid_to_workers"] is not None:
+            ov["paid_to_workers"] = r["paid_to_workers"]
+        overrides[r["location"]] = ov
+    return overrides
+
+
+def db_set_override(report_date: str, location: str, field: str, value):
+    if field not in ("hours", "total_workers", "paid_to_workers"):
+        raise ValueError(f"Невідоме поле override: {field}")
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO report_overrides (report_date, location) VALUES (?, ?) "
+        "ON CONFLICT(report_date, location) DO NOTHING",
+        (report_date, location)
+    )
+    conn.execute(
+        f"UPDATE report_overrides SET {field} = ? WHERE report_date = ? AND location = ?",
+        (value, report_date, location)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_override(report_date: str, location: str):
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM report_overrides WHERE report_date = ? AND location = ?",
+        (report_date, location)
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
+migrate_json_to_db()
 
 
 # ==================== GOOGLE SHEETS ====================
@@ -508,11 +696,10 @@ def is_card_number(text: str) -> bool:
 def compute_location_data(report_date: str) -> list:
     """Повертає впорядкований список локацій з годинами/кількістю людей/сумою виплат/тарифом/доходом.
     Враховує ручні правки (overrides), якщо вони є."""
-    session = reports_data.get(report_date, {})
-    messages = session.get("messages", [])
-    overrides = session.get("overrides", {})
+    messages = db_get_messages(report_date)
     if not messages:
         return []
+    overrides = db_get_overrides(report_date)
 
     cities = load_cities()
 
@@ -772,13 +959,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if report_date == "waiting_date":
         return
 
-    reports_data.setdefault(report_date, {"messages": []})
-    reports_data[report_date]["messages"].append({
-        'text': text,
-        'timestamp': msg.date.isoformat(),
-        'message_id': msg.message_id,
-    })
-    save_reports_data()
+    db_add_message(report_date, text, msg.date.isoformat(), msg.message_id)
 
 
 # ==================== KEYBOARDS ====================
@@ -794,8 +975,7 @@ def get_main_keyboard():
 
 
 def get_reports_list_keyboard():
-    dates = list(reports_data.keys())
-    dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"), reverse=True)
+    dates = db_list_report_dates()
     keyboard = [[InlineKeyboardButton(d, callback_data=f"rdate_{d}")] for d in dates]
     return keyboard, dates
 
@@ -986,11 +1166,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         location = state['location']
         override_key = FIELD_TO_OVERRIDE_KEY[field]
 
-        reports_data.setdefault(report_date, {"messages": []})
-        reports_data[report_date].setdefault('overrides', {})
-        reports_data[report_date]['overrides'].setdefault(location, {})
-        reports_data[report_date]['overrides'][location][override_key] = value
-        save_reports_data()
+        db_set_override(report_date, location, override_key, value)
 
         del edit_state[user_id]
 
@@ -1009,8 +1185,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             datetime.strptime(text_input, "%d.%m.%Y")
             current_report_date[user_id] = text_input
-            reports_data.setdefault(text_input, {"messages": []})
-            save_reports_data()
             keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
             await update.message.reply_text(
                 f"✅ Дата звіту: {text_input}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -1111,8 +1285,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "report_yesterday":
         d = (date.today() - timedelta(days=1)).strftime("%d.%m.%Y")
         current_report_date[query.from_user.id] = d
-        reports_data.setdefault(d, {"messages": []})
-        save_reports_data()
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
             f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -1122,8 +1294,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "report_today":
         d = date.today().strftime("%d.%m.%Y")
         current_report_date[query.from_user.id] = d
-        reports_data.setdefault(d, {"messages": []})
-        save_reports_data()
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
             f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -1164,8 +1334,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("rdelconfirm_"):
         d = data.replace("rdelconfirm_", "")
-        reports_data.pop(d, None)
-        save_reports_data()
+        db_delete_report(d)
         await query.edit_message_text(f"✅ Звіт за {d} видалено.")
 
     elif data.startswith("rdel_"):
@@ -1274,8 +1443,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Позицію не знайдено.")
             return
         location = locations[idx]['location']
-        reports_data.get(d, {}).get('overrides', {}).pop(location, None)
-        save_reports_data()
+        db_delete_override(d, location)
         await query.edit_message_text(f"✅ Правки для '{location}' скинуто до початкових значень.")
 
     elif data.startswith("show_"):
