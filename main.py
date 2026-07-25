@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 current_report_date = {}
 edit_state = {}  # user_id -> {"date": ..., "location": ..., "field": "hours"|"workers"|"paid"}
 worker_flow_state = {}  # user_id -> {"mode": "add_name"|"add_phone"|"add_username"|"add_card"|"edit_field", ...}
+anketa_state = {}  # user_id -> {"step": "name"|"age"|"phone", "data": {...}} — для незнайомих людей (не ALLOWED_USERS)
 
 WORKER_FIELD_LABELS = {
     "name": "ім'я",
@@ -69,7 +70,7 @@ FIELD_TO_OVERRIDE_KEY = {
 
 # Тексты кнопок Reply Keyboard — их нельзя перехватывать как оплату/карту в группе
 BUTTON_TEXTS = {
-    "📦 Поставки", "🏙 Мої міста", "📊 Звіт", "🗂 Мої звіти", "👷 Робітники",
+    "📦 Поставки", "🏙 Мої міста", "📊 Звіт", "🗂 Мої звіти", "👷 Робітники", "📇 Кандидати",
 }
 
 
@@ -112,6 +113,24 @@ def init_db():
             username TEXT,
             card_number TEXT,
             created_at TEXT
+        )
+    """)
+    worker_cols = [r["name"] for r in conn.execute("PRAGMA table_info(workers)")]
+    if "telegram_id" not in worker_cols:
+        conn.execute("ALTER TABLE workers ADD COLUMN telegram_id INTEGER")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_contacts (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            full_name_ua TEXT,
+            age TEXT,
+            phone TEXT,
+            anketa_completed_at TEXT,
+            converted_to_worker_id INTEGER
         )
     """)
     conn.execute("""
@@ -324,11 +343,11 @@ def db_delete_override(report_date: str, location: str):
 
 
 # ==================== РОБІТНИКИ ====================
-def db_add_worker(name: str, phone: str = "", username: str = "", card: str = "") -> int:
+def db_add_worker(name: str, phone: str = "", username: str = "", card: str = "", telegram_id: int = None) -> int:
     conn = get_conn()
     cur = conn.execute(
-        "INSERT INTO workers (name, phone, username, card_number, created_at) VALUES (?, ?, ?, ?, ?)",
-        (name, phone, username, card, datetime.now().isoformat())
+        "INSERT INTO workers (name, phone, username, card_number, telegram_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, phone, username, card, telegram_id, datetime.now().isoformat())
     )
     conn.commit()
     worker_id = cur.lastrowid
@@ -346,10 +365,14 @@ def ua_sort_key(name: str):
 
 def db_get_workers() -> list:
     conn = get_conn()
-    rows = conn.execute("SELECT id, name, phone, username, card_number FROM workers").fetchall()
+    rows = conn.execute("SELECT id, name, phone, username, card_number, telegram_id FROM workers").fetchall()
     conn.close()
     workers = [
-        {"id": r["id"], "name": r["name"], "phone": r["phone"] or "", "username": r["username"] or "", "card": r["card_number"] or ""}
+        {
+            "id": r["id"], "name": r["name"], "phone": r["phone"] or "",
+            "username": r["username"] or "", "card": r["card_number"] or "",
+            "telegram_id": r["telegram_id"],
+        }
         for r in rows
     ]
     workers.sort(key=lambda w: ua_sort_key(w["name"]))
@@ -358,11 +381,18 @@ def db_get_workers() -> list:
 
 def db_get_worker(worker_id: int):
     conn = get_conn()
-    r = conn.execute("SELECT id, name, phone, username, card_number FROM workers WHERE id = ?", (worker_id,)).fetchone()
+    r = conn.execute(
+        "SELECT id, name, phone, username, card_number, telegram_id FROM workers WHERE id = ?",
+        (worker_id,)
+    ).fetchone()
     conn.close()
     if not r:
         return None
-    return {"id": r["id"], "name": r["name"], "phone": r["phone"] or "", "username": r["username"] or "", "card": r["card_number"] or ""}
+    return {
+        "id": r["id"], "name": r["name"], "phone": r["phone"] or "",
+        "username": r["username"] or "", "card": r["card_number"] or "",
+        "telegram_id": r["telegram_id"],
+    }
 
 
 def db_update_worker(worker_id: int, field: str, value: str):
@@ -378,6 +408,62 @@ def db_update_worker(worker_id: int, field: str, value: str):
 def db_delete_worker(worker_id: int):
     conn = get_conn()
     conn.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
+    conn.commit()
+    conn.close()
+
+
+# ==================== КОНТАКТИ БОТА (для "знайомства" з незнайомими людьми) ====================
+def db_touch_contact(user):
+    """Логуємо/оновлюємо будь-якого, хто написав боту — незалежно від того, чи є в ALLOWED_USERS."""
+    conn = get_conn()
+    now = datetime.now().isoformat()
+    existing = conn.execute("SELECT telegram_id FROM bot_contacts WHERE telegram_id = ?", (user.id,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE bot_contacts SET username=?, first_name=?, last_name=?, last_seen=? WHERE telegram_id=?",
+            (user.username or "", user.first_name or "", user.last_name or "", now, user.id)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO bot_contacts (telegram_id, username, first_name, last_name, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user.id, user.username or "", user.first_name or "", user.last_name or "", now, now)
+        )
+    conn.commit()
+    conn.close()
+
+
+def db_save_anketa(telegram_id: int, data: dict):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE bot_contacts SET full_name_ua=?, age=?, phone=?, anketa_completed_at=? WHERE telegram_id=?",
+        (data.get("full_name", ""), data.get("age", ""), data.get("phone", ""), datetime.now().isoformat(), telegram_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_contact(telegram_id: int):
+    conn = get_conn()
+    r = conn.execute("SELECT * FROM bot_contacts WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    conn.close()
+    return dict(r) if r else None
+
+
+def db_list_pending_contacts() -> list:
+    """Ті, хто заповнив анкету, але ще не доданий у реєстр робітників."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM bot_contacts WHERE anketa_completed_at IS NOT NULL AND converted_to_worker_id IS NULL "
+        "ORDER BY anketa_completed_at DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def db_mark_converted(telegram_id: int, worker_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE bot_contacts SET converted_to_worker_id = ? WHERE telegram_id = ?", (worker_id, telegram_id))
     conn.commit()
     conn.close()
 
@@ -1048,6 +1134,7 @@ def get_main_keyboard():
             ["📦 Поставки"],
             ["🏙 Мої міста", "📊 Звіт"],
             ["🗂 Мої звіти", "👷 Робітники"],
+            ["📇 Кандидати"],
         ],
         resize_keyboard=True
     )
@@ -1066,6 +1153,27 @@ def get_workers_list_keyboard():
     return keyboard, workers
 
 
+def get_candidates_list_keyboard():
+    candidates = db_list_pending_contacts()
+    keyboard = [
+        [InlineKeyboardButton(c["full_name_ua"] or f"ID {c['telegram_id']}", callback_data=f"cand_{c['telegram_id']}")]
+        for c in candidates
+    ]
+    return keyboard, candidates
+
+
+def format_candidate_card(c: dict) -> str:
+    lines = [f"📇 *{c['full_name_ua'] or '(без імені)'}*"]
+    if c.get("age"):
+        lines.append(f"🎂 Вік: {c['age']}")
+    if c.get("phone"):
+        lines.append(f"📞 {c['phone']}")
+    if c.get("username"):
+        lines.append(f"💬 @{c['username']}")
+    lines.append(f"🆔 {c['telegram_id']}")
+    return "\n".join(lines)
+
+
 def format_worker_card(w: dict) -> str:
     lines = [f"👷 *{w['name']}*"]
     if w["phone"]:
@@ -1074,11 +1182,20 @@ def format_worker_card(w: dict) -> str:
         lines.append(f"💬 @{w['username']}")
     if w["card"]:
         lines.append(f"💳 {w['card']}")
+    if w.get("telegram_id"):
+        lines.append(f"🆔 {w['telegram_id']} (справжній Telegram ID, підтверджений)")
     return "\n".join(lines)
 
 
 def get_worker_card_keyboard(worker_id: int) -> InlineKeyboardMarkup:
-    keyboard = [
+    w = db_get_worker(worker_id)
+    keyboard = []
+
+    if w and (w.get("telegram_id") or w.get("username")):
+        chat_url = f"tg://user?id={w['telegram_id']}" if w.get("telegram_id") else f"https://t.me/{w['username']}"
+        keyboard.append([InlineKeyboardButton("💬 Написати", url=chat_url)])
+
+    keyboard += [
         [
             InlineKeyboardButton("✏️ Ім'я", callback_data=f"wf_{worker_id}_name"),
             InlineKeyboardButton("✏️ Телефон", callback_data=f"wf_{worker_id}_phone"),
@@ -1139,13 +1256,67 @@ async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, sourc
 
 # ==================== КОМАНДИ ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS:
-        await update.message.reply_text("⛔ Доступ заборонено.")
+    user = update.effective_user
+    db_touch_contact(user)
+
+    if user.id not in ALLOWED_USERS:
+        anketa_state[user.id] = {"step": "name", "data": {}}
+        await update.message.reply_text(
+            "👋 Вітаю! Щоб зв'язатися з вами щодо роботи, надішліть, будь ласка, "
+            "невелику інформацію про себе.\n\nПрізвище та ім'я:"
+        )
         return
+
     await update.message.reply_text(
         "👋 Привіт! Я бот для поставок FM Logistics.\n\nОбери розділ:",
         reply_markup=get_main_keyboard()
     )
+
+
+async def notify_admins_new_contact(bot, user, data: dict):
+    text = (
+        f"📇 *Нова заявка*\n\n"
+        f"Прізвище та ім'я: {data.get('full_name', '—')}\n"
+        f"Вік: {data.get('age', '—')}\n"
+        f"Телефон: {data.get('phone', '—')}\n"
+        f"Telegram: {'@' + user.username if user.username else '(немає username)'}\n"
+        f"ID: {user.id}"
+    )
+    for admin_id in ALLOWED_USERS:
+        try:
+            await send_with_retry(bot, admin_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Не вдалося сповістити {admin_id} про нову заявку: {e}")
+
+
+async def handle_anketa_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    state = anketa_state[user.id]
+    raw = update.message.text.strip()
+    step = state["step"]
+
+    if step == "name":
+        if not raw:
+            await update.message.reply_text("Введіть, будь ласка, прізвище та ім'я:")
+            return
+        state["data"]["full_name"] = raw
+        state["step"] = "age"
+        await update.message.reply_text("Вік:")
+        return
+
+    if step == "age":
+        state["data"]["age"] = raw
+        state["step"] = "phone"
+        await update.message.reply_text("Номер телефону:")
+        return
+
+    if step == "phone":
+        state["data"]["phone"] = raw
+        db_save_anketa(user.id, state["data"])
+        del anketa_state[user.id]
+        await update.message.reply_text("✅ Дякую! Ми зв'яжемося з вами за потреби.")
+        await notify_admins_new_contact(context.bot, user, state["data"])
+        return
 
 
 async def mycities(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1256,10 +1427,15 @@ async def removealias(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== TEXT HANDLER ====================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ALLOWED_USERS:
+    user = update.effective_user
+    db_touch_contact(user)
+
+    if user.id not in ALLOWED_USERS:
+        if user.id in anketa_state:
+            await handle_anketa_step(update, context)
         return
 
-    user_id = update.effective_user.id
+    user_id = user.id
 
     if user_id in worker_flow_state:
         state = worker_flow_state[user_id]
@@ -1396,6 +1572,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "👷 Робітники":
         keyboard, workers = get_workers_list_keyboard()
         msg = "Робітники:" if workers else "❌ Поки немає жодного працівника."
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif text == "📇 Кандидати":
+        keyboard, candidates = get_candidates_list_keyboard()
+        msg = "Нові заявки (ще не в реєстрі):" if candidates else "❌ Поки немає нових заявок."
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -1676,6 +1857,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await query.edit_message_text(
             format_worker_card(w),
+            parse_mode="Markdown",
+            reply_markup=get_worker_card_keyboard(worker_id)
+        )
+
+    elif data.startswith("cand_"):
+        telegram_id = int(data.replace("cand_", ""))
+        c = db_get_contact(telegram_id)
+        if not c:
+            await query.edit_message_text("❌ Кандидата не знайдено.")
+            return
+        keyboard = [
+            [InlineKeyboardButton("➕ Додати в реєстр", callback_data=f"wclaim_{telegram_id}")],
+            [InlineKeyboardButton("◀️ До списку", callback_data="candback")],
+        ]
+        await query.edit_message_text(
+            format_candidate_card(c),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data == "candback":
+        keyboard, candidates = get_candidates_list_keyboard()
+        msg = "Нові заявки (ще не в реєстрі):" if candidates else "❌ Поки немає нових заявок."
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("wclaim_"):
+        telegram_id = int(data.replace("wclaim_", ""))
+        c = db_get_contact(telegram_id)
+        if not c:
+            await query.edit_message_text("❌ Кандидата не знайдено.")
+            return
+        worker_id = db_add_worker(
+            name=c.get("full_name_ua") or c.get("first_name") or f"ID {telegram_id}",
+            phone=c.get("phone") or "",
+            username=c.get("username") or "",
+            telegram_id=telegram_id,
+        )
+        db_mark_converted(telegram_id, worker_id)
+        w = db_get_worker(worker_id)
+        await query.edit_message_text(
+            f"✅ Додано в реєстр:\n\n{format_worker_card(w)}",
             parse_mode="Markdown",
             reply_markup=get_worker_card_keyboard(worker_id)
         )
