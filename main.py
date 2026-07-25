@@ -54,8 +54,6 @@ FIELD_TO_OVERRIDE_KEY = {
 # Тексты кнопок Reply Keyboard — их нельзя перехватывать как оплату/карту в группе
 BUTTON_TEXTS = {
     "📦 Поставки", "🏙 Мої міста", "📊 Звіт", "🗂 Мої звіти",
-    "📋 Всі поставки", "📅 На сьогодні", "📅 На завтра",
-    "🔢 На конкретну дату", "◀️ Назад",
 }
 
 
@@ -703,18 +701,6 @@ def get_main_keyboard():
     )
 
 
-def get_deliveries_keyboard():
-    return ReplyKeyboardMarkup(
-        [
-            ["📋 Всі поставки"],
-            ["📅 На сьогодні", "📅 На завтра"],
-            ["🔢 На конкретну дату"],
-            ["◀️ Назад"],
-        ],
-        resize_keyboard=True
-    )
-
-
 def get_reports_list_keyboard():
     dates = list(reports_data.keys())
     dates.sort(key=lambda d: datetime.strptime(d, "%d.%m.%Y"), reverse=True)
@@ -968,29 +954,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if text == "📦 Поставки":
+        keyboard = [
+            [InlineKeyboardButton("📋 Всі поставки", callback_data="dlv_all")],
+            [InlineKeyboardButton("📅 На сьогодні", callback_data="dlv_today")],
+            [InlineKeyboardButton("📅 На завтра", callback_data="dlv_tomorrow")],
+            [InlineKeyboardButton("🔢 На конкретну дату", callback_data="dlv_pick")],
+        ]
         await update.message.reply_text(
             "Обери що показати:",
-            reply_markup=get_deliveries_keyboard()
-        )
-    elif text == "◀️ Назад":
-        await update.message.reply_text(
-            "Головне меню:",
-            reply_markup=get_main_keyboard()
-        )
-    elif text == "📋 Всі поставки":
-        await send_deliveries_msg(update, context, filter_date=None)
-    elif text == "📅 На сьогодні":
-        await send_deliveries_msg(update, context, filter_date=date.today())
-    elif text == "📅 На завтра":
-        await send_deliveries_msg(update, context, filter_date=date.today() + timedelta(days=1))
-    elif text == "🔢 На конкретну дату":
-        keyboard = []
-        for i in range(7):
-            d = date.today() + timedelta(days=i)
-            label = d.strftime("%d.%m.%Y")
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{label}")])
-        await update.message.reply_text(
-            "Оберіть дату:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     elif text == "🏙 Мої міста":
@@ -1025,7 +996,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data.startswith("date_"):
+    if data == "dlv_all":
+        await send_deliveries_query(query, context, filter_date=None)
+
+    elif data == "dlv_today":
+        await send_deliveries_query(query, context, filter_date=date.today())
+
+    elif data == "dlv_tomorrow":
+        await send_deliveries_query(query, context, filter_date=date.today() + timedelta(days=1))
+
+    elif data == "dlv_pick":
+        keyboard = []
+        for i in range(7):
+            d = date.today() + timedelta(days=i)
+            label = d.strftime("%d.%m.%Y")
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{label}")])
+        await query.edit_message_text("Оберіть дату:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("date_"):
         date_str = data.replace("date_", "")
         try:
             filter_date = datetime.strptime(date_str, "%d.%m.%Y").date()
