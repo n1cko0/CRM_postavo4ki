@@ -141,6 +141,8 @@ def init_db():
     contact_cols = [r["name"] for r in conn.execute("PRAGMA table_info(bot_contacts)")]
     if "city_raw" not in contact_cols:
         conn.execute("ALTER TABLE bot_contacts ADD COLUMN city_raw TEXT")
+    if "dismissed" not in contact_cols:
+        conn.execute("ALTER TABLE bot_contacts ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS report_overrides (
             report_date TEXT NOT NULL,
@@ -462,10 +464,11 @@ def db_get_contact(telegram_id: int):
 
 
 def db_list_pending_contacts() -> list:
-    """Ті, хто заповнив анкету, але ще не доданий у реєстр робітників."""
+    """Ті, хто заповнив анкету, але ще не доданий у реєстр робітників і не відхилений."""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT * FROM bot_contacts WHERE anketa_completed_at IS NOT NULL AND converted_to_worker_id IS NULL "
+        "SELECT * FROM bot_contacts WHERE anketa_completed_at IS NOT NULL "
+        "AND converted_to_worker_id IS NULL AND dismissed = 0 "
         "ORDER BY anketa_completed_at DESC"
     ).fetchall()
     conn.close()
@@ -475,6 +478,13 @@ def db_list_pending_contacts() -> list:
 def db_mark_converted(telegram_id: int, worker_id: int):
     conn = get_conn()
     conn.execute("UPDATE bot_contacts SET converted_to_worker_id = ? WHERE telegram_id = ?", (worker_id, telegram_id))
+    conn.commit()
+    conn.close()
+
+
+def db_dismiss_contact(telegram_id: int):
+    conn = get_conn()
+    conn.execute("UPDATE bot_contacts SET dismissed = 1 WHERE telegram_id = ?", (telegram_id,))
     conn.commit()
     conn.close()
 
@@ -1927,6 +1937,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         keyboard = [
             [InlineKeyboardButton("➕ Додати в реєстр", callback_data=f"wclaim_{telegram_id}")],
+            [InlineKeyboardButton("❌ Відхилити", callback_data=f"canddismiss_{telegram_id}")],
             [InlineKeyboardButton("◀️ До списку", callback_data="candback")],
         ]
         await query.edit_message_text(
@@ -1938,6 +1949,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "candback":
         keyboard, candidates = get_candidates_list_keyboard()
         msg = "Нові заявки (ще не в реєстрі):" if candidates else "❌ Поки немає нових заявок."
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("canddismiss_"):
+        telegram_id = int(data.replace("canddismiss_", ""))
+        db_dismiss_contact(telegram_id)
+        keyboard, candidates = get_candidates_list_keyboard()
+        msg = "✅ Заявку відхилено.\n\n" + ("Нові заявки (ще не в реєстрі):" if candidates else "Поки немає нових заявок.")
         await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("wclaim_"):
