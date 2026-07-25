@@ -352,6 +352,81 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
     return messages
 
 
+# ==================== EKOL ====================
+def normalize_apostrophes(text: str) -> str:
+    return text.replace('’', "'").replace('`', "'").replace('ʼ', "'")
+
+
+def address_matches_my_cities(address: str, cities: dict) -> bool:
+    """Перевіряє, чи згадується в адресі хоча б одне з моїх міст (або синонім) —
+    точним співпадінням цілого слова, без урахування регістру."""
+    addr_lower = normalize_apostrophes(address.lower())
+    for city_name, info in cities.items():
+        aliases = info.get('aliases', []) if isinstance(info, dict) else []
+        for candidate in [city_name] + aliases:
+            candidate_lower = normalize_apostrophes(candidate.lower())
+            pattern = r'\b' + re.escape(candidate_lower) + r'\b'
+            if re.search(pattern, addr_lower):
+                return True
+    return False
+
+
+def parse_ekol_deliveries(all_values: list, filter_date: date = None) -> list:
+    """Колонки: A компанія, B адреса, C дата, D час, E кількість, F вантажники, G телефон.
+    Кожен рядок — окрема, незалежна поставка (без merged cells)."""
+    cities = load_cities()
+    messages = []
+
+    for row in all_values:
+        company = row[0].strip() if len(row) > 0 else ""
+        address = row[1].strip() if len(row) > 1 else ""
+        date_str = row[2].strip() if len(row) > 2 else ""
+        time_str = row[3].strip() if len(row) > 3 else ""
+        qty = row[4].strip() if len(row) > 4 else ""
+        workers = row[5].strip() if len(row) > 5 else ""
+        phone = row[6].strip() if len(row) > 6 else ""
+
+        if not address or not date_str:
+            continue
+
+        parsed_date = None
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+            try:
+                parsed_date = datetime.strptime(date_str, fmt).date()
+                break
+            except ValueError:
+                continue
+        if not parsed_date:
+            continue  # не рядок з даними (шапка таблиці, порожній рядок тощо)
+
+        if filter_date and parsed_date != filter_date:
+            continue
+
+        if not address_matches_my_cities(address, cities):
+            continue
+
+        msg = f"📦 *{company or '—'}*\n"
+        msg += f"📍 {address}\n"
+        msg += f"📅 {date_str}"
+        if time_str:
+            msg += f"  🕐 {time_str}"
+        msg += "\n"
+        if qty:
+            msg += f"📦 Кількість: {qty}\n"
+        if workers:
+            msg += f"👷 Вантажників: {workers}\n"
+        if phone:
+            msg += f"📞 {phone}"
+
+        messages.append({
+            "text": msg.strip(),
+            "date": parsed_date,
+            "date_str": date_str,
+        })
+
+    return messages
+
+
 # ==================== ЗВІТ ТА СТАТИСТИКА ====================
 def parse_payment_message(text: str):
     """Парсим первую строку сообщения об оплате"""
@@ -731,16 +806,13 @@ async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, sourc
     label = SOURCE_LABEL.get(source, source)
     await query.edit_message_text(f"⏳ {emoji} Завантажую дані з таблиці {label}...")
     try:
-        if source == "ekol":
-            await send_with_retry(
-                bot, chat_id,
-                f"{emoji} Парсинг таблиці Ekol ще не реалізовано. Скоро додамо!"
-            )
-            return
-
         all_values, merged_cells = get_sheet_data(source=source)
-        routes = parse_routes(all_values, merged_cells)
-        messages = build_delivery_messages(routes, merged_cells, filter_date=filter_date)
+
+        if source == "ekol":
+            messages = parse_ekol_deliveries(all_values, filter_date=filter_date)
+        else:
+            routes = parse_routes(all_values, merged_cells)
+            messages = build_delivery_messages(routes, merged_cells, filter_date=filter_date)
 
         if not messages:
             date_info = filter_date.strftime("%d.%m.%Y") if filter_date else ""
