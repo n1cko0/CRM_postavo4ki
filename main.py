@@ -2576,6 +2576,76 @@ def build_driver_columns(target_date: date, date_str: str) -> dict:
     return columns
 
 
+PX_PER_HOUR = 110
+CARD_CENTER_OFFSET = 56  # приблизна половина висоти картки — щоб нитка проходила саме через центр
+MIN_CARD_GAP = 110       # мінімальна відстань по вертикалі між сусідніми картками одного водія
+HEADER_OFFSET = 44       # місце під заголовок колонки (номер водія) над першою карткою
+DRIVER_COLORS = ["#2F5D46", "#3D5A73", "#8A5E74", "#8A6F2F", "#5E5A8A", "#2F7A6B", "#7A4A4A"]
+
+
+def compute_time_range(columns: dict):
+    minutes = [it["sort_key"] for items in columns.values() for it in items if it["sort_key"] < 99999]
+    if not minutes:
+        return 6 * 60, 20 * 60
+    lo = max(0, (min(minutes) // 60) * 60 - 60)
+    hi = min(24 * 60, ((max(minutes) // 60) + 1) * 60 + 60)
+    if hi - lo < 120:
+        hi = lo + 120
+    return lo, hi
+
+
+def assign_card_positions(columns: dict, lo: int) -> float:
+    """Проставляє item['top'] (у пікселях, без урахування HEADER_OFFSET) для кожної картки.
+    Повертає найбільший 'top' серед усіх колонок."""
+    overall_max = 0.0
+    for phone, items in columns.items():
+        with_time = [it for it in items if it["sort_key"] < 99999]
+        without_time = [it for it in items if it["sort_key"] >= 99999]
+
+        prev_top = None
+        for it in with_time:
+            top = (it["sort_key"] - lo) / 60 * PX_PER_HOUR
+            if prev_top is not None and top < prev_top + MIN_CARD_GAP:
+                top = prev_top + MIN_CARD_GAP
+            it["top"] = top
+            prev_top = top
+
+        next_top = (prev_top + MIN_CARD_GAP) if prev_top is not None else 0.0
+        for it in without_time:
+            it["top"] = next_top
+            next_top += MIN_CARD_GAP
+
+        col_items = with_time + without_time
+        if col_items:
+            overall_max = max(overall_max, max(it["top"] for it in col_items))
+
+    return overall_max
+
+
+def build_ruler_html(lo: int, hi: int, total_height: float) -> str:
+    step = 60 if (hi - lo) <= 14 * 60 else 120
+    ticks = ""
+    m = lo
+    while m <= hi:
+        top = HEADER_OFFSET + (m - lo) / 60 * PX_PER_HOUR
+        ticks += f'<div class="tick" style="top:{top}px;">{m // 60:02d}:{m % 60:02d}</div>'
+        m += step
+
+    periods = [
+        ("РАНОК", lo, min(hi, 11 * 60)),
+        ("ДЕНЬ", max(lo, 11 * 60), min(hi, 17 * 60)),
+        ("ВЕЧІР", max(lo, 17 * 60), hi),
+    ]
+    period_html = ""
+    for label, seg_lo, seg_hi in periods:
+        if seg_hi > seg_lo:
+            mid = (seg_lo + seg_hi) / 2
+            top = HEADER_OFFSET + (mid - lo) / 60 * PX_PER_HOUR
+            period_html += f'<div class="period" style="top:{top}px;">{label}</div>'
+
+    return f'<div class="ruler" style="height:{total_height}px;">{period_html}{ticks}</div>'
+
+
 DASHBOARD_CSS = """
 * { margin:0; padding:0; box-sizing:border-box; }
 html, body { height:100%; overflow:hidden; background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#14201A; }
@@ -2585,12 +2655,28 @@ html, body { height:100%; overflow:hidden; background:#E9E9E7; font-family:'Inte
 .nav { display:flex; align-items:center; gap:12px; margin-top:6px; }
 .nav a { text-decoration:none; color:#2F5D46; font-weight:600; font-size:14px; padding:4px 10px; border-radius:8px; background:#F7F7F4; border:1px solid #ECECE8; }
 .nav span { font-size:13px; color:#6B6B68; }
-.board { flex:1; overflow:auto; -webkit-overflow-scrolling:touch; touch-action:pan-x pan-y; position:relative; }
+.board { flex:1; overflow:auto; -webkit-overflow-scrolling:touch; touch-action:pan-x pan-y; position:relative; background:#E9E9E7; }
 .board-spacer { position:relative; }
-.board-inner { position:absolute; top:0; left:0; display:flex; align-items:flex-start; gap:14px; padding:0 20px 40px; transform-origin:0 0; will-change:transform; }
-.col { flex:0 0 260px; background:#F7F7F4; border:1px solid #ECECE8; border-radius:16px; padding:14px; }
-.col-head { font-size:13px; font-weight:700; margin-bottom:10px; color:#14201A; }
-.card { background:white; border:1px solid #ECECE8; border-radius:12px; padding:10px 12px; margin-bottom:10px; font-size:12.5px; line-height:1.5; }
+.board-inner {
+  position:absolute; top:0; left:0; display:flex; align-items:flex-start; gap:14px; padding:20px 20px 40px;
+  transform-origin:0 0; will-change:transform;
+  background-image: radial-gradient(circle, #D6D6D0 1.6px, transparent 1.6px);
+  background-size: 22px 22px;
+  background-position: 6px 6px;
+}
+.ruler { flex:0 0 56px; position:relative; }
+.ruler .tick { position:absolute; left:0; right:8px; text-align:right; font-size:10.5px; color:#ADADA8; font-weight:500; transform:translateY(-50%); white-space:nowrap; }
+.ruler .tick::after { content:''; position:absolute; right:-8px; top:50%; width:6px; height:1px; background:#C7C7C1; }
+.ruler .period { position:absolute; left:0; font-size:9px; letter-spacing:0.1em; color:#B7B7B0; font-weight:700; writing-mode:vertical-rl; text-orientation:mixed; transform:translateY(-50%); }
+.col { flex:0 0 250px; position:relative; }
+.col-head { font-size:13px; font-weight:700; padding:8px 6px; color:#14201A; }
+.card {
+  position:absolute; left:6px; right:6px; z-index:2;
+  background:#F7F7F4; border:1px solid #ECECE8; border-radius:12px; border-left-width:3px;
+  padding:10px 12px; font-size:12.5px; line-height:1.5;
+  box-shadow:0 1px 2px rgba(0,0,0,0.03), 0 4px 10px rgba(0,0,0,0.04);
+}
+.thread { position:absolute; left:calc(50% - 1px); width:2px; z-index:1; border-radius:2px; opacity:0.55; }
 .badge { display:inline-block; font-size:10.5px; font-weight:600; padding:2px 8px; border-radius:20px; margin-top:6px; margin-right:4px; }
 .badge.ok { background:#DCE8E0; color:#2F5D46; }
 .badge.need { background:#F5E3D8; color:#8A5E2F; }
@@ -2630,9 +2716,28 @@ async def dashboard_handler(request):
     if not columns:
         cols_html = '<div class="empty">Поставок на цю дату не знайдено.</div>'
     else:
-        for phone, items in columns.items():
+        lo, hi = compute_time_range(columns)
+        overall_max_top = assign_card_positions(columns, lo)
+        total_height = HEADER_OFFSET + max(overall_max_top + 160, (hi - lo) / 60 * PX_PER_HOUR + 40)
+
+        cols_html += build_ruler_html(lo, hi, total_height)
+
+        for col_idx, (phone, items) in enumerate(columns.items()):
+            color = DRIVER_COLORS[col_idx % len(DRIVER_COLORS)]
             cards_html = ""
-            for item in items:
+
+            for idx, item in enumerate(items):
+                top = HEADER_OFFSET + item["top"]
+
+                if idx < len(items) - 1:
+                    next_top = HEADER_OFFSET + items[idx + 1]["top"]
+                    line_top = top + CARD_CENTER_OFFSET
+                    line_h = (next_top + CARD_CENTER_OFFSET) - line_top
+                    cards_html += (
+                        f'<div class="thread" style="top:{line_top}px; height:{line_h}px; '
+                        f'background:{color};"></div>'
+                    )
+
                 assigned = item["assigned"]
                 needed = item["needed"]
                 chips = ""
@@ -2654,12 +2759,16 @@ async def dashboard_handler(request):
 
                 src_emoji = SOURCE_EMOJI.get(item["source"], "")
                 cards_html += (
-                    f'<div class="card">{telegram_md_to_html(item["text"])}'
+                    f'<div class="card" style="top:{top}px; border-left-color:{color};">'
+                    f'{telegram_md_to_html(item["text"])}'
                     f'<div>{badge}{chips}</div>'
                     f'<div class="src">{src_emoji} {SOURCE_LABEL.get(item["source"], "")}</div></div>'
                 )
 
-            cols_html += f'<div class="col"><div class="col-head">📞 {html_module.escape(phone)}</div>{cards_html}</div>'
+            cols_html += (
+                f'<div class="col" style="height:{total_height}px;">'
+                f'<div class="col-head">📞 {html_module.escape(phone)}</div>{cards_html}</div>'
+            )
 
     page = f"""<!DOCTYPE html>
 <html lang="uk"><head><meta charset="UTF-8">
