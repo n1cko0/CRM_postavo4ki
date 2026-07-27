@@ -534,6 +534,19 @@ def db_unassign_worker(delivery_key: str, worker_id: int):
 
 def db_get_assigned_workers(delivery_key: str) -> list:
     conn = get_conn()
+
+    # міграція зі старого формату ключа (без закодованої кількості потрібних людей):
+    # якщо є записи під "коротким" ключем цієї ж поставки — переносимо їх на новий ключ
+    parts = delivery_key.split(":")
+    if len(parts) >= 4:
+        legacy_key = ":".join(parts[:3])
+        if legacy_key != delivery_key:
+            conn.execute(
+                "UPDATE delivery_assignments SET delivery_key = ? WHERE delivery_key = ?",
+                (delivery_key, legacy_key)
+            )
+            conn.commit()
+
     rows = conn.execute("""
         SELECT w.id, w.name, w.username, w.telegram_id FROM delivery_assignments da
         JOIN workers w ON w.id = da.worker_id
