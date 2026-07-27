@@ -459,6 +459,26 @@ def db_delete_worker_phone(phone_id: int):
     conn.close()
 
 
+def db_update_worker_phone(phone_id: int, value: str):
+    conn = get_conn()
+    conn.execute("UPDATE worker_phones SET phone = ? WHERE id = ?", (value, phone_id))
+    conn.commit()
+    conn.close()
+
+
+def db_promote_worker_phone(worker_id: int, phone_id: int):
+    """Робить додатковий номер основним, а старий основний переносить у додаткові."""
+    phones = db_get_worker_phones(worker_id)
+    target = next((p for p in phones if p["id"] == phone_id), None)
+    if not target:
+        return
+    old_primary = db_get_worker(worker_id).get("phone", "")
+    db_update_worker(worker_id, "phone", target["phone"])
+    db_delete_worker_phone(phone_id)
+    if old_primary:
+        db_add_worker_phone(worker_id, old_primary)
+
+
 def normalize_phone(phone: str) -> str:
     """Прибирає все, крім цифр, і код країни/ведучий нуль — щоб порівнювати
     +380664492617 / 0664492617 / 380664492617 як один і той самий номер."""
@@ -1368,24 +1388,47 @@ def get_worker_card_keyboard(worker_id: int) -> InlineKeyboardMarkup:
     keyboard += [
         [
             InlineKeyboardButton("✏️ Ім'я", callback_data=f"wf_{worker_id}_name"),
-            InlineKeyboardButton("✏️ Телефон", callback_data=f"wf_{worker_id}_phone"),
+            InlineKeyboardButton("📞 Телефони", callback_data=f"wphones_{worker_id}"),
         ],
         [
             InlineKeyboardButton("✏️ Місто", callback_data=f"wf_{worker_id}_city"),
             InlineKeyboardButton("✏️ Username", callback_data=f"wf_{worker_id}_username"),
         ],
         [InlineKeyboardButton("✏️ Картка", callback_data=f"wf_{worker_id}_card")],
-        [InlineKeyboardButton("➕ Ще номер телефону", callback_data=f"wphoneadd_{worker_id}")],
-    ]
-
-    if db_get_worker_phones(worker_id):
-        keyboard.append([InlineKeyboardButton("🗑 Видалити номер", callback_data=f"wphoneslist_{worker_id}")])
-
-    keyboard += [
         [InlineKeyboardButton("🔗 Об'єднати з іншим", callback_data=f"wmergestart_{worker_id}")],
         [InlineKeyboardButton("🗑 Видалити", callback_data=f"wdel_{worker_id}")],
         [InlineKeyboardButton("◀️ До списку", callback_data="wback")],
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_phones_management_keyboard(worker_id: int) -> InlineKeyboardMarkup:
+    w = db_get_worker(worker_id)
+    keyboard = []
+    if w and w.get("phone"):
+        keyboard.append([InlineKeyboardButton(f"📞 {w['phone']} (основний)", callback_data=f"wphoneview_{worker_id}_main")])
+    else:
+        keyboard.append([InlineKeyboardButton("➕ Додати основний номер", callback_data=f"wf_{worker_id}_phone")])
+    for p in db_get_worker_phones(worker_id):
+        keyboard.append([InlineKeyboardButton(f"📞 {p['phone']}", callback_data=f"wphoneview_{worker_id}_{p['id']}")])
+    keyboard.append([InlineKeyboardButton("➕ Додати ще номер", callback_data=f"wphoneadd_{worker_id}")])
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"wview_{worker_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_phone_action_keyboard(worker_id: int, token: str) -> InlineKeyboardMarkup:
+    if token == "main":
+        keyboard = [
+            [InlineKeyboardButton("✏️ Змінити", callback_data=f"wf_{worker_id}_phone")],
+            [InlineKeyboardButton("🗑 Видалити", callback_data=f"wphoneclearmain_{worker_id}")],
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("✏️ Змінити", callback_data=f"wphoneeditextra_{token}_{worker_id}")],
+            [InlineKeyboardButton("⭐ Зробити основним", callback_data=f"wphonepromote_{token}_{worker_id}")],
+            [InlineKeyboardButton("🗑 Видалити", callback_data=f"wphonedel_{token}_{worker_id}")],
+        ]
+    keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"wphones_{worker_id}")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1456,6 +1499,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    worker_flow_state.pop(user.id, None)
+    edit_state.pop(user.id, None)
     await update.message.reply_text(
         "👋 Привіт! Я бот для поставок FM Logistics.\n\nОбери розділ:",
         reply_markup=get_main_keyboard()
@@ -1632,6 +1677,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = user.id
+    incoming_text = update.message.text.strip()
+
+    # Натискання кнопки меню скасовує будь-який незавершений флоу редагування —
+    # інакше текст кнопки "проковтується" як відповідь на попереднє питання бота
+    if incoming_text in BUTTON_TEXTS:
+        worker_flow_state.pop(user_id, None)
+        edit_state.pop(user_id, None)
 
     if user_id in worker_flow_state:
         state = worker_flow_state[user_id]
@@ -1697,6 +1749,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Додано номер.\n\n{format_worker_card(w)}",
                     parse_mode="Markdown",
                     reply_markup=get_worker_card_keyboard(worker_id)
+                )
+            return
+
+        if mode == "edit_phone_extra":
+            phone_id = state["phone_id"]
+            worker_id = state["worker_id"]
+            if raw == "-":
+                db_delete_worker_phone(phone_id)
+            else:
+                db_update_worker_phone(phone_id, raw)
+            del worker_flow_state[user_id]
+            w = db_get_worker(worker_id)
+            if w:
+                await update.message.reply_text(
+                    f"✅ Оновлено.\n\n{format_worker_card(w)}",
+                    parse_mode="Markdown",
+                    reply_markup=get_phones_management_keyboard(worker_id)
                 )
             return
 
@@ -2219,15 +2288,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         worker_flow_state[query.from_user.id] = {"mode": "add_phone2", "worker_id": worker_id}
         await query.edit_message_text("Введіть додатковий номер телефону:")
 
-    elif data.startswith("wphoneslist_"):
-        worker_id = int(data.replace("wphoneslist_", ""))
-        phones = db_get_worker_phones(worker_id)
-        keyboard = [
-            [InlineKeyboardButton(f"🗑 {p['phone']}", callback_data=f"wphonedel_{p['id']}_{worker_id}")]
-            for p in phones
-        ]
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"wview_{worker_id}")])
-        await query.edit_message_text("Який номер видалити?", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("wphones_"):
+        worker_id = int(data.replace("wphones_", ""))
+        w = db_get_worker(worker_id)
+        if not w:
+            await query.edit_message_text("❌ Працівника не знайдено.")
+            return
+        await query.edit_message_text(
+            f"Телефони — {w['name']}:",
+            reply_markup=get_phones_management_keyboard(worker_id)
+        )
+
+    elif data.startswith("wphoneview_"):
+        rest = data.replace("wphoneview_", "")
+        worker_id_str, token = rest.split("_", 1)
+        worker_id = int(worker_id_str)
+        label = "Основний номер" if token == "main" else "Додатковий номер"
+        await query.edit_message_text(
+            f"{label}. Що зробити?",
+            reply_markup=get_phone_action_keyboard(worker_id, token)
+        )
+
+    elif data.startswith("wphoneclearmain_"):
+        worker_id = int(data.replace("wphoneclearmain_", ""))
+        db_update_worker(worker_id, "phone", "")
+        await query.edit_message_text(
+            "✅ Основний номер очищено.",
+            reply_markup=get_phones_management_keyboard(worker_id)
+        )
+
+    elif data.startswith("wphoneeditextra_"):
+        rest = data.replace("wphoneeditextra_", "")
+        phone_id_str, worker_id_str = rest.split("_")
+        phone_id, worker_id = int(phone_id_str), int(worker_id_str)
+        worker_flow_state[query.from_user.id] = {"mode": "edit_phone_extra", "phone_id": phone_id, "worker_id": worker_id}
+        await query.edit_message_text("Введіть нове значення номера:")
+
+    elif data.startswith("wphonepromote_"):
+        rest = data.replace("wphonepromote_", "")
+        phone_id_str, worker_id_str = rest.split("_")
+        phone_id, worker_id = int(phone_id_str), int(worker_id_str)
+        db_promote_worker_phone(worker_id, phone_id)
+        w = db_get_worker(worker_id)
+        await query.edit_message_text(
+            f"✅ Готово.\n\n{format_worker_card(w)}",
+            parse_mode="Markdown",
+            reply_markup=get_phones_management_keyboard(worker_id)
+        )
 
     elif data.startswith("wphonedel_"):
         rest = data.replace("wphonedel_", "")
@@ -2238,7 +2345,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ Номер видалено.\n\n{format_worker_card(w)}",
             parse_mode="Markdown",
-            reply_markup=get_worker_card_keyboard(worker_id)
+            reply_markup=get_phones_management_keyboard(worker_id)
         )
 
 
