@@ -490,11 +490,21 @@ def db_promote_worker_phone(worker_id: int, phone_id: int):
 
 
 # ==================== ПРИЗНАЧЕННЯ РОБІТНИКІВ НА ПОСТАВКИ ====================
-def make_delivery_key(source: str, date_str: str, text: str) -> str:
+def make_delivery_key(source: str, date_str: str, text: str, needed: int = None) -> str:
     """Стабільний ключ поставки: не залежить від сесії/id повідомлення,
-    тільки від змісту картки — щоб призначення переживали рестарт бота."""
+    тільки від змісту картки — щоб призначення переживали рестарт бота.
+    Кількість потрібних людей закодована прямо в ключі (щоб клавіатуру
+    можна було перебудувати з самого ключа, без додаткового стану)."""
     h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    return f"{source}:{date_str}:{h}"
+    needed_part = str(needed) if needed else "x"
+    return f"{source}:{date_str}:{h}:{needed_part}"
+
+
+def get_needed_from_key(delivery_key: str):
+    parts = delivery_key.split(":")
+    if len(parts) >= 4 and parts[3].isdigit():
+        return int(parts[3])
+    return None
 
 
 def db_assign_worker(delivery_key: str, worker_id: int):
@@ -525,22 +535,43 @@ def db_unassign_worker(delivery_key: str, worker_id: int):
 def db_get_assigned_workers(delivery_key: str) -> list:
     conn = get_conn()
     rows = conn.execute("""
-        SELECT w.id, w.name FROM delivery_assignments da
+        SELECT w.id, w.name, w.username, w.telegram_id FROM delivery_assignments da
         JOIN workers w ON w.id = da.worker_id
         WHERE da.delivery_key = ?
         ORDER BY da.id
     """, (delivery_key,)).fetchall()
     conn.close()
-    return [{"id": r["id"], "name": r["name"]} for r in rows]
+    return [
+        {"id": r["id"], "name": r["name"], "username": r["username"] or "", "telegram_id": r["telegram_id"]}
+        for r in rows
+    ]
 
 
 def get_delivery_assign_keyboard(delivery_key: str) -> InlineKeyboardMarkup:
     assigned = db_get_assigned_workers(delivery_key)
-    keyboard = [
-        [InlineKeyboardButton(f"❌ {w['name']}", callback_data=f"unassign_{delivery_key}_{w['id']}")]
-        for w in assigned
-    ]
-    keyboard.append([InlineKeyboardButton("➕ Призначити", callback_data=f"assign_{delivery_key}")])
+    needed = get_needed_from_key(delivery_key)
+    keyboard = []
+
+    for w in assigned:
+        row = []
+        if w.get("telegram_id") or w.get("username"):
+            chat_url = f"tg://user?id={w['telegram_id']}" if w.get("telegram_id") else f"https://t.me/{w['username']}"
+            row.append(InlineKeyboardButton(w["name"], url=chat_url))
+        else:
+            row.append(InlineKeyboardButton(w["name"], callback_data="noop"))
+        row.append(InlineKeyboardButton("❌", callback_data=f"unassign_{delivery_key}_{w['id']}"))
+        keyboard.append(row)
+
+    count = len(assigned)
+    if needed and count >= needed:
+        keyboard.append([
+            InlineKeyboardButton(f"✅ Набрано ({count}/{needed})", callback_data="noop"),
+            InlineKeyboardButton("➕ Призначити", callback_data=f"assign_{delivery_key}"),
+        ])
+    else:
+        label = f"➕ Призначити ({count}/{needed})" if needed else "➕ Призначити"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"assign_{delivery_key}")])
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -918,12 +949,20 @@ def build_delivery_messages(routes: list, merged_cells: list, filter_date: date 
                 "text": msg,
                 "date": first["date"],
                 "date_str": first["date_str"],
+                "workers_needed": parse_int_safe(first.get("workers")),
             })
 
     return messages
 
 
 # ==================== EKOL ====================
+def parse_int_safe(value) -> int:
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def normalize_apostrophes(text: str) -> str:
     return text.replace('’', "'").replace('`', "'").replace('ʼ', "'")
 
@@ -993,6 +1032,7 @@ def parse_ekol_deliveries(all_values: list, filter_date: date = None) -> list:
             "text": msg.strip(),
             "date": parsed_date,
             "date_str": date_str,
+            "workers_needed": parse_int_safe(workers),
         })
 
     return messages
@@ -1543,7 +1583,9 @@ async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, sourc
         )
 
         for msg_data in messages:
-            delivery_key = make_delivery_key(source, msg_data["date_str"], msg_data["text"])
+            delivery_key = make_delivery_key(
+                source, msg_data["date_str"], msg_data["text"], needed=msg_data.get("workers_needed")
+            )
             await send_with_retry(
                 bot, chat_id, msg_data["text"], parse_mode="Markdown",
                 reply_markup=get_delivery_assign_keyboard(delivery_key)
@@ -2445,6 +2487,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delivery_key, worker_id_str = rest.rsplit("_", 1)
         db_unassign_worker(delivery_key, int(worker_id_str))
         await query.edit_message_reply_markup(reply_markup=get_delivery_assign_keyboard(delivery_key))
+
+    elif data == "noop":
+        pass  # інформаційна кнопка (наприклад "✅ Набрано" або ім'я без контакту) — нічого не робимо
 
 
 # ==================== MAIN ====================
