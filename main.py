@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import difflib
+import hashlib
 import json
 import os
 import sqlite3
@@ -130,6 +131,15 @@ def init_db():
             created_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_key TEXT NOT NULL,
+            worker_id INTEGER NOT NULL,
+            created_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_assignments_key ON delivery_assignments(delivery_key)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_contacts (
             telegram_id INTEGER PRIMARY KEY,
@@ -477,6 +487,61 @@ def db_promote_worker_phone(worker_id: int, phone_id: int):
     db_delete_worker_phone(phone_id)
     if old_primary:
         db_add_worker_phone(worker_id, old_primary)
+
+
+# ==================== ПРИЗНАЧЕННЯ РОБІТНИКІВ НА ПОСТАВКИ ====================
+def make_delivery_key(source: str, date_str: str, text: str) -> str:
+    """Стабільний ключ поставки: не залежить від сесії/id повідомлення,
+    тільки від змісту картки — щоб призначення переживали рестарт бота."""
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"{source}:{date_str}:{h}"
+
+
+def db_assign_worker(delivery_key: str, worker_id: int):
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT id FROM delivery_assignments WHERE delivery_key = ? AND worker_id = ?",
+        (delivery_key, worker_id)
+    ).fetchone()
+    if not existing:
+        conn.execute(
+            "INSERT INTO delivery_assignments (delivery_key, worker_id, created_at) VALUES (?, ?, ?)",
+            (delivery_key, worker_id, datetime.now().isoformat())
+        )
+        conn.commit()
+    conn.close()
+
+
+def db_unassign_worker(delivery_key: str, worker_id: int):
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM delivery_assignments WHERE delivery_key = ? AND worker_id = ?",
+        (delivery_key, worker_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_get_assigned_workers(delivery_key: str) -> list:
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT w.id, w.name FROM delivery_assignments da
+        JOIN workers w ON w.id = da.worker_id
+        WHERE da.delivery_key = ?
+        ORDER BY da.id
+    """, (delivery_key,)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
+def get_delivery_assign_keyboard(delivery_key: str) -> InlineKeyboardMarkup:
+    assigned = db_get_assigned_workers(delivery_key)
+    keyboard = [
+        [InlineKeyboardButton(f"❌ {w['name']}", callback_data=f"unassign_{delivery_key}_{w['id']}")]
+        for w in assigned
+    ]
+    keyboard.append([InlineKeyboardButton("➕ Призначити", callback_data=f"assign_{delivery_key}")])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def normalize_phone(phone: str) -> str:
@@ -1246,11 +1311,11 @@ def format_stats_message(report_date: str, stats: dict) -> str:
     return "\n".join(lines)
 
 
-async def send_with_retry(bot, chat_id: int, text: str, parse_mode: str = None, max_retries: int = 5):
+async def send_with_retry(bot, chat_id: int, text: str, parse_mode: str = None, reply_markup=None, max_retries: int = 5):
     """Отправка с обробкою Telegram flood control (RetryAfter) та інших тимчасових помилок."""
     for attempt in range(max_retries):
         try:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
             return
         except RetryAfter as e:
             wait = e.retry_after + 1
@@ -1260,7 +1325,7 @@ async def send_with_retry(bot, chat_id: int, text: str, parse_mode: str = None, 
             logger.warning(f"Помилка відправки, чекаємо 2с: {e}")
             await asyncio.sleep(2)
     # остання спроба без придушення помилки — щоб вона стала видною в логах
-    await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
 async def send_report_and_stats(bot, chat_id: int, report_date: str, reports: list, stats: dict, mode: str = "both"):
@@ -1478,7 +1543,11 @@ async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, sourc
         )
 
         for msg_data in messages:
-            await send_with_retry(bot, chat_id, msg_data["text"], parse_mode="Markdown")
+            delivery_key = make_delivery_key(source, msg_data["date_str"], msg_data["text"])
+            await send_with_retry(
+                bot, chat_id, msg_data["text"], parse_mode="Markdown",
+                reply_markup=get_delivery_assign_keyboard(delivery_key)
+            )
             await asyncio.sleep(0.35)
 
     except Exception as e:
@@ -2347,6 +2416,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=get_phones_management_keyboard(worker_id)
         )
+
+    elif data.startswith("assignpick_"):
+        rest = data.replace("assignpick_", "")
+        delivery_key, worker_id_str = rest.rsplit("_", 1)
+        db_assign_worker(delivery_key, int(worker_id_str))
+        await query.edit_message_reply_markup(reply_markup=get_delivery_assign_keyboard(delivery_key))
+
+    elif data.startswith("assignback_"):
+        delivery_key = data.replace("assignback_", "")
+        await query.edit_message_reply_markup(reply_markup=get_delivery_assign_keyboard(delivery_key))
+
+    elif data.startswith("assign_"):
+        delivery_key = data.replace("assign_", "")
+        workers = db_get_workers()
+        if not workers:
+            await query.answer("Реєстр робітників порожній — спочатку додай когось у 👷 Робітники.", show_alert=True)
+            return
+        keyboard = [
+            [InlineKeyboardButton(w["name"] or f"#{w['id']}", callback_data=f"assignpick_{delivery_key}_{w['id']}")]
+            for w in workers
+        ]
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"assignback_{delivery_key}")])
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("unassign_"):
+        rest = data.replace("unassign_", "")
+        delivery_key, worker_id_str = rest.rsplit("_", 1)
+        db_unassign_worker(delivery_key, int(worker_id_str))
+        await query.edit_message_reply_markup(reply_markup=get_delivery_assign_keyboard(delivery_key))
 
 
 # ==================== MAIN ====================
