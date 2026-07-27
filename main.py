@@ -422,6 +422,64 @@ def db_delete_worker(worker_id: int):
     conn.close()
 
 
+def normalize_phone(phone: str) -> str:
+    """Прибирає все, крім цифр, і код країни/ведучий нуль — щоб порівнювати
+    +380664492617 / 0664492617 / 380664492617 як один і той самий номер."""
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("380") and len(digits) > 9:
+        digits = digits[3:]
+    elif digits.startswith("0") and len(digits) == 10:
+        digits = digits[1:]
+    return digits
+
+
+def db_find_matching_worker(username: str = "", phone: str = "", telegram_id: int = None, exclude_id: int = None):
+    """Шукає серед вже існуючих робітників того, хто, ймовірно, — та сама людина
+    (за telegram_id, username або нормалізованим номером телефону)."""
+    username_norm = username.strip().lstrip("@").lower() if username else ""
+    phone_norm = normalize_phone(phone) if phone else ""
+
+    for w in db_get_workers():
+        if exclude_id and w["id"] == exclude_id:
+            continue
+        if telegram_id and w.get("telegram_id") == telegram_id:
+            return w
+        if username_norm and w.get("username", "").lower() == username_norm:
+            return w
+        if phone_norm and normalize_phone(w.get("phone", "")) == phone_norm:
+            return w
+    return None
+
+
+def db_merge_workers(keep_id: int, remove_id: int):
+    """Об'єднує remove_id в keep_id: переносить порожні поля, видаляє дубль."""
+    keep = db_get_worker(keep_id)
+    remove = db_get_worker(remove_id)
+    if not keep or not remove:
+        return keep
+
+    for field in ("phone", "username", "card", "city"):
+        if not keep.get(field) and remove.get(field):
+            db_update_worker(keep_id, field, remove[field])
+
+    if not keep.get("telegram_id") and remove.get("telegram_id"):
+        conn = get_conn()
+        conn.execute("UPDATE workers SET telegram_id = ? WHERE id = ?", (remove["telegram_id"], keep_id))
+        conn.commit()
+        conn.close()
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE bot_contacts SET converted_to_worker_id = ? WHERE converted_to_worker_id = ?",
+        (keep_id, remove_id)
+    )
+    conn.commit()
+    conn.close()
+
+    db_delete_worker(remove_id)
+    return db_get_worker(keep_id)
+
+
 # ==================== КОНТАКТИ БОТА (для "знайомства" з незнайомими людьми) ====================
 def db_touch_contact(user):
     """Логуємо/оновлюємо будь-якого, хто написав боту — незалежно від того, чи є в ALLOWED_USERS."""
@@ -1265,9 +1323,20 @@ def get_worker_card_keyboard(worker_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Username", callback_data=f"wf_{worker_id}_username"),
         ],
         [InlineKeyboardButton("✏️ Картка", callback_data=f"wf_{worker_id}_card")],
+        [InlineKeyboardButton("🔗 Об'єднати з іншим", callback_data=f"wmergestart_{worker_id}")],
         [InlineKeyboardButton("🗑 Видалити", callback_data=f"wdel_{worker_id}")],
         [InlineKeyboardButton("◀️ До списку", callback_data="wback")],
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_merge_target_keyboard(worker_id: int) -> InlineKeyboardMarkup:
+    others = [w for w in db_get_workers() if w["id"] != worker_id]
+    keyboard = [
+        [InlineKeyboardButton(w["name"] or f"#{w['id']}", callback_data=f"wmergepick_{worker_id}_{w['id']}")]
+        for w in others
+    ]
+    keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data=f"wview_{worker_id}")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1964,6 +2033,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not c:
             await query.edit_message_text("❌ Кандидата не знайдено.")
             return
+
+        existing = db_find_matching_worker(
+            username=c.get("username") or "", phone=c.get("phone") or "", telegram_id=telegram_id
+        )
+        if existing:
+            keyboard = [
+                [InlineKeyboardButton("🔗 Так, це він — об'єднати", callback_data=f"wmergeconfirm_{telegram_id}_{existing['id']}")],
+                [InlineKeyboardButton("➕ Ні, це інша людина", callback_data=f"wforcenew_{telegram_id}")],
+            ]
+            text = (
+                f"⚠️ Схоже, такий працівник вже є в реєстрі:\n\n{format_worker_card(existing)}\n\n"
+                f"Новий кандидат:\n{format_candidate_card(c)}"
+            )
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
         worker_id = db_add_worker(
             name=c.get("full_name_ua") or c.get("first_name") or f"ID {telegram_id}",
             phone=c.get("phone") or "",
@@ -1977,6 +2062,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Додано в реєстр:\n\n{format_worker_card(w)}",
             parse_mode="Markdown",
             reply_markup=get_worker_card_keyboard(worker_id)
+        )
+
+    elif data.startswith("wmergeconfirm_"):
+        rest = data.replace("wmergeconfirm_", "")
+        telegram_id_str, existing_id_str = rest.split("_")
+        telegram_id, existing_id = int(telegram_id_str), int(existing_id_str)
+        c = db_get_contact(telegram_id)
+        if c:
+            for field, val in (("phone", c.get("phone", "")), ("username", c.get("username", "")), ("city", c.get("city_raw", ""))):
+                if val and not db_get_worker(existing_id).get(field):
+                    db_update_worker(existing_id, field, val)
+            w = db_get_worker(existing_id)
+            if not w.get("telegram_id"):
+                conn = get_conn()
+                conn.execute("UPDATE workers SET telegram_id = ? WHERE id = ?", (telegram_id, existing_id))
+                conn.commit()
+                conn.close()
+        db_mark_converted(telegram_id, existing_id)
+        w = db_get_worker(existing_id)
+        await query.edit_message_text(
+            f"✅ Об'єднано:\n\n{format_worker_card(w)}",
+            parse_mode="Markdown",
+            reply_markup=get_worker_card_keyboard(existing_id)
+        )
+
+    elif data.startswith("wforcenew_"):
+        telegram_id = int(data.replace("wforcenew_", ""))
+        c = db_get_contact(telegram_id)
+        if not c:
+            await query.edit_message_text("❌ Кандидата не знайдено.")
+            return
+        worker_id = db_add_worker(
+            name=c.get("full_name_ua") or c.get("first_name") or f"ID {telegram_id}",
+            phone=c.get("phone") or "",
+            username=c.get("username") or "",
+            telegram_id=telegram_id,
+            city=c.get("city_raw") or "",
+        )
+        db_mark_converted(telegram_id, worker_id)
+        w = db_get_worker(worker_id)
+        await query.edit_message_text(
+            f"✅ Додано окремим записом:\n\n{format_worker_card(w)}",
+            parse_mode="Markdown",
+            reply_markup=get_worker_card_keyboard(worker_id)
+        )
+
+    elif data.startswith("wmergestart_"):
+        worker_id = int(data.replace("wmergestart_", ""))
+        await query.edit_message_text(
+            "З ким об'єднати цього працівника?",
+            reply_markup=get_merge_target_keyboard(worker_id)
+        )
+
+    elif data.startswith("wmergepick_"):
+        rest = data.replace("wmergepick_", "")
+        id1_str, id2_str = rest.split("_")
+        id1, id2 = int(id1_str), int(id2_str)
+        w1, w2 = db_get_worker(id1), db_get_worker(id2)
+        if not w1 or not w2:
+            await query.edit_message_text("❌ Одного з записів не знайдено.")
+            return
+        keyboard = [
+            [InlineKeyboardButton("✅ Так, об'єднати", callback_data=f"wmergedo_{id1}_{id2}")],
+            [InlineKeyboardButton("❌ Скасувати", callback_data=f"wview_{id1}")],
+        ]
+        text = f"Об'єднати ці два записи в один?\n\n{format_worker_card(w1)}\n\n➕\n\n{format_worker_card(w2)}"
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("wmergedo_"):
+        rest = data.replace("wmergedo_", "")
+        id1_str, id2_str = rest.split("_")
+        id1, id2 = int(id1_str), int(id2_str)
+        merged = db_merge_workers(id1, id2)
+        await query.edit_message_text(
+            f"✅ Об'єднано:\n\n{format_worker_card(merged)}",
+            parse_mode="Markdown",
+            reply_markup=get_worker_card_keyboard(id1)
         )
 
 
