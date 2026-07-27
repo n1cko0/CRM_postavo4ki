@@ -2585,7 +2585,9 @@ html, body { height:100%; overflow:hidden; background:#E9E9E7; font-family:'Inte
 .nav { display:flex; align-items:center; gap:12px; margin-top:6px; }
 .nav a { text-decoration:none; color:#2F5D46; font-weight:600; font-size:14px; padding:4px 10px; border-radius:8px; background:#F7F7F4; border:1px solid #ECECE8; }
 .nav span { font-size:13px; color:#6B6B68; }
-.board { flex:1; display:flex; align-items:flex-start; gap:14px; overflow:auto; padding:0 20px 40px; -webkit-overflow-scrolling:touch; touch-action:pan-x pan-y; }
+.board { flex:1; overflow:auto; -webkit-overflow-scrolling:touch; touch-action:pan-x pan-y; position:relative; }
+.board-spacer { position:relative; }
+.board-inner { position:absolute; top:0; left:0; display:flex; align-items:flex-start; gap:14px; padding:0 20px 40px; transform-origin:0 0; will-change:transform; }
 .col { flex:0 0 260px; background:#F7F7F4; border:1px solid #ECECE8; border-radius:16px; padding:14px; }
 .col-head { font-size:13px; font-weight:700; margin-bottom:10px; color:#14201A; }
 .card { background:white; border:1px solid #ECECE8; border-radius:12px; padding:10px 12px; margin-bottom:10px; font-size:12.5px; line-height:1.5; }
@@ -2595,6 +2597,9 @@ html, body { height:100%; overflow:hidden; background:#E9E9E7; font-family:'Inte
 .worker-chip { display:inline-block; font-size:11px; background:#EFEFEA; color:#3D5A46; padding:2px 8px; border-radius:20px; margin:2px 4px 0 0; text-decoration:none; }
 .empty { color:#B0B0AC; font-size:13px; padding:40px 20px; }
 .src { font-size:10px; color:#B0B0AC; }
+.zoom-controls { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:20; }
+.zoom-controls button { width:42px; height:42px; border-radius:50%; border:1px solid #ECECE8; background:white; font-size:19px; box-shadow:0 2px 10px rgba(0,0,0,0.12); cursor:pointer; color:#14201A; }
+.zoom-controls button:active { background:#F0F0EC; }
 """
 
 LOGIN_CSS = """
@@ -2658,7 +2663,7 @@ async def dashboard_handler(request):
 
     page = f"""<!DOCTYPE html>
 <html lang="uk"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Маршрути водіїв</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -2673,8 +2678,109 @@ async def dashboard_handler(request):
     <a href="/?date={next_date}">{next_date} →</a>
   </div>
 </div>
-<div class="board">{cols_html}</div>
+<div class="board" id="board">
+  <div class="board-spacer" id="boardSpacer">
+    <div class="board-inner" id="boardInner">{cols_html}</div>
+  </div>
 </div>
+<div class="zoom-controls">
+  <button id="zoomIn" aria-label="Наблизити">+</button>
+  <button id="zoomOut" aria-label="Віддалити">−</button>
+  <button id="zoomFit" aria-label="Показати все">⤢</button>
+</div>
+</div>
+<script>
+(function() {{
+  var board = document.getElementById('board');
+  var spacer = document.getElementById('boardSpacer');
+  var inner = document.getElementById('boardInner');
+
+  var zoom = 1, minZoom = 0.3, maxZoom = 2.5;
+  var naturalW = 0, naturalH = 0;
+
+  function measure() {{
+    inner.style.transform = 'scale(1)';
+    naturalW = inner.scrollWidth;
+    naturalH = inner.scrollHeight;
+  }}
+
+  function applyZoom(z, focalX, focalY) {{
+    z = Math.min(maxZoom, Math.max(minZoom, z));
+    var ratio = z / zoom;
+    var beforeX = (focalX !== undefined) ? board.scrollLeft + focalX : 0;
+    var beforeY = (focalY !== undefined) ? board.scrollTop + focalY : 0;
+    zoom = z;
+    spacer.style.width = (naturalW * zoom) + 'px';
+    spacer.style.height = (naturalH * zoom) + 'px';
+    inner.style.transform = 'scale(' + zoom + ')';
+    if (focalX !== undefined) {{
+      board.scrollLeft = beforeX * ratio - focalX;
+      board.scrollTop = beforeY * ratio - focalY;
+    }}
+  }}
+
+  function fitAll() {{
+    var fitZoom = Math.min(board.clientWidth / naturalW, board.clientHeight / naturalH);
+    minZoom = Math.min(fitZoom, 1);
+    applyZoom(fitZoom);
+    board.scrollLeft = 0;
+    board.scrollTop = 0;
+  }}
+
+  function dist(t1, t2) {{
+    return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+  }}
+
+  window.addEventListener('load', function() {{
+    measure();
+    var fitZoom = Math.min(board.clientWidth / naturalW, board.clientHeight / naturalH);
+    minZoom = Math.min(fitZoom, 1);
+    applyZoom(1);
+  }});
+
+  var pinchStartDist = null, pinchStartZoom = 1;
+
+  board.addEventListener('touchstart', function(e) {{
+    if (e.touches.length === 2) {{
+      e.preventDefault();
+      pinchStartDist = dist(e.touches[0], e.touches[1]);
+      pinchStartZoom = zoom;
+    }}
+  }}, {{passive:false}});
+
+  board.addEventListener('touchmove', function(e) {{
+    if (e.touches.length === 2 && pinchStartDist) {{
+      e.preventDefault();
+      var d = dist(e.touches[0], e.touches[1]);
+      var factor = d / pinchStartDist;
+      var rect = board.getBoundingClientRect();
+      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+      applyZoom(pinchStartZoom * factor, midX, midY);
+    }}
+  }}, {{passive:false}});
+
+  board.addEventListener('touchend', function(e) {{
+    if (e.touches.length < 2) pinchStartDist = null;
+  }});
+
+  board.addEventListener('wheel', function(e) {{
+    if (e.ctrlKey) {{
+      e.preventDefault();
+      var rect = board.getBoundingClientRect();
+      applyZoom(zoom * (e.deltaY < 0 ? 1.1 : 0.9), e.clientX - rect.left, e.clientY - rect.top);
+    }}
+  }}, {{passive:false}});
+
+  document.getElementById('zoomIn').onclick = function() {{
+    applyZoom(zoom * 1.3, board.clientWidth / 2, board.clientHeight / 2);
+  }};
+  document.getElementById('zoomOut').onclick = function() {{
+    applyZoom(zoom / 1.3, board.clientWidth / 2, board.clientHeight / 2);
+  }};
+  document.getElementById('zoomFit').onclick = fitAll;
+}})();
+</script>
 </body></html>"""
 
     return web.Response(text=page, content_type="text/html")
