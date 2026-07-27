@@ -123,6 +123,14 @@ def init_db():
     if "city" not in worker_cols:
         conn.execute("ALTER TABLE workers ADD COLUMN city TEXT")
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS worker_phones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id INTEGER NOT NULL,
+            phone TEXT NOT NULL,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_contacts (
             telegram_id INTEGER PRIMARY KEY,
             username TEXT,
@@ -417,7 +425,36 @@ def db_update_worker(worker_id: int, field: str, value: str):
 
 def db_delete_worker(worker_id: int):
     conn = get_conn()
+    conn.execute("DELETE FROM worker_phones WHERE worker_id = ?", (worker_id,))
     conn.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_add_worker_phone(worker_id: int, phone: str) -> int:
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO worker_phones (worker_id, phone, created_at) VALUES (?, ?, ?)",
+        (worker_id, phone, datetime.now().isoformat())
+    )
+    conn.commit()
+    phone_id = cur.lastrowid
+    conn.close()
+    return phone_id
+
+
+def db_get_worker_phones(worker_id: int) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, phone FROM worker_phones WHERE worker_id = ? ORDER BY id", (worker_id,)
+    ).fetchall()
+    conn.close()
+    return [{"id": r["id"], "phone": r["phone"]} for r in rows]
+
+
+def db_delete_worker_phone(phone_id: int):
+    conn = get_conn()
+    conn.execute("DELETE FROM worker_phones WHERE id = ?", (phone_id,))
     conn.commit()
     conn.close()
 
@@ -435,7 +472,7 @@ def normalize_phone(phone: str) -> str:
 
 def db_find_matching_worker(username: str = "", phone: str = "", telegram_id: int = None, exclude_id: int = None):
     """Шукає серед вже існуючих робітників того, хто, ймовірно, — та сама людина
-    (за telegram_id, username або нормалізованим номером телефону)."""
+    (за telegram_id, username або нормалізованим номером телефону — основним чи додатковим)."""
     username_norm = username.strip().lstrip("@").lower() if username else ""
     phone_norm = normalize_phone(phone) if phone else ""
 
@@ -446,21 +483,33 @@ def db_find_matching_worker(username: str = "", phone: str = "", telegram_id: in
             return w
         if username_norm and w.get("username", "").lower() == username_norm:
             return w
-        if phone_norm and normalize_phone(w.get("phone", "")) == phone_norm:
-            return w
+        if phone_norm:
+            if normalize_phone(w.get("phone", "")) == phone_norm:
+                return w
+            if any(normalize_phone(p["phone"]) == phone_norm for p in db_get_worker_phones(w["id"])):
+                return w
     return None
 
 
 def db_merge_workers(keep_id: int, remove_id: int):
-    """Об'єднує remove_id в keep_id: переносить порожні поля, видаляє дубль."""
+    """Об'єднує remove_id в keep_id: переносить порожні поля, зберігає інший номер
+    телефону як додатковий (не втрачає його), видаляє дубль."""
     keep = db_get_worker(keep_id)
     remove = db_get_worker(remove_id)
     if not keep or not remove:
         return keep
 
-    for field in ("phone", "username", "card", "city"):
+    for field in ("username", "card", "city"):
         if not keep.get(field) and remove.get(field):
             db_update_worker(keep_id, field, remove[field])
+
+    if not keep.get("phone") and remove.get("phone"):
+        db_update_worker(keep_id, "phone", remove["phone"])
+    elif keep.get("phone") and remove.get("phone"):
+        if normalize_phone(keep["phone"]) != normalize_phone(remove["phone"]):
+            already = [normalize_phone(p["phone"]) for p in db_get_worker_phones(keep_id)]
+            if normalize_phone(remove["phone"]) not in already:
+                db_add_worker_phone(keep_id, remove["phone"])
 
     if not keep.get("telegram_id") and remove.get("telegram_id"):
         conn = get_conn()
@@ -469,6 +518,7 @@ def db_merge_workers(keep_id: int, remove_id: int):
         conn.close()
 
     conn = get_conn()
+    conn.execute("UPDATE worker_phones SET worker_id = ? WHERE worker_id = ?", (keep_id, remove_id))
     conn.execute(
         "UPDATE bot_contacts SET converted_to_worker_id = ? WHERE converted_to_worker_id = ?",
         (keep_id, remove_id)
@@ -1294,6 +1344,8 @@ def format_worker_card(w: dict) -> str:
     lines = [f"👷 *{w['name']}*"]
     if w["phone"]:
         lines.append(f"📞 {w['phone']}")
+    for p in db_get_worker_phones(w["id"]):
+        lines.append(f"📞 {p['phone']} _(додатковий)_")
     if w.get("city"):
         lines.append(f"📍 {w['city']}")
     if w["username"]:
@@ -1323,6 +1375,13 @@ def get_worker_card_keyboard(worker_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Username", callback_data=f"wf_{worker_id}_username"),
         ],
         [InlineKeyboardButton("✏️ Картка", callback_data=f"wf_{worker_id}_card")],
+        [InlineKeyboardButton("➕ Ще номер телефону", callback_data=f"wphoneadd_{worker_id}")],
+    ]
+
+    if db_get_worker_phones(worker_id):
+        keyboard.append([InlineKeyboardButton("🗑 Видалити номер", callback_data=f"wphoneslist_{worker_id}")])
+
+    keyboard += [
         [InlineKeyboardButton("🔗 Об'єднати з іншим", callback_data=f"wmergestart_{worker_id}")],
         [InlineKeyboardButton("🗑 Видалити", callback_data=f"wdel_{worker_id}")],
         [InlineKeyboardButton("◀️ До списку", callback_data="wback")],
@@ -1622,6 +1681,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if w:
                 await update.message.reply_text(
                     f"✅ Оновлено.\n\n{format_worker_card(w)}",
+                    parse_mode="Markdown",
+                    reply_markup=get_worker_card_keyboard(worker_id)
+                )
+            return
+
+        if mode == "add_phone2":
+            worker_id = state["worker_id"]
+            if raw:
+                db_add_worker_phone(worker_id, raw)
+            del worker_flow_state[user_id]
+            w = db_get_worker(worker_id)
+            if w:
+                await update.message.reply_text(
+                    f"✅ Додано номер.\n\n{format_worker_card(w)}",
                     parse_mode="Markdown",
                     reply_markup=get_worker_card_keyboard(worker_id)
                 )
@@ -2139,6 +2212,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Об'єднано:\n\n{format_worker_card(merged)}",
             parse_mode="Markdown",
             reply_markup=get_worker_card_keyboard(id1)
+        )
+
+    elif data.startswith("wphoneadd_"):
+        worker_id = int(data.replace("wphoneadd_", ""))
+        worker_flow_state[query.from_user.id] = {"mode": "add_phone2", "worker_id": worker_id}
+        await query.edit_message_text("Введіть додатковий номер телефону:")
+
+    elif data.startswith("wphoneslist_"):
+        worker_id = int(data.replace("wphoneslist_", ""))
+        phones = db_get_worker_phones(worker_id)
+        keyboard = [
+            [InlineKeyboardButton(f"🗑 {p['phone']}", callback_data=f"wphonedel_{p['id']}_{worker_id}")]
+            for p in phones
+        ]
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"wview_{worker_id}")])
+        await query.edit_message_text("Який номер видалити?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("wphonedel_"):
+        rest = data.replace("wphonedel_", "")
+        phone_id_str, worker_id_str = rest.split("_")
+        phone_id, worker_id = int(phone_id_str), int(worker_id_str)
+        db_delete_worker_phone(phone_id)
+        w = db_get_worker(worker_id)
+        await query.edit_message_text(
+            f"✅ Номер видалено.\n\n{format_worker_card(w)}",
+            parse_mode="Markdown",
+            reply_markup=get_worker_card_keyboard(worker_id)
         )
 
 
