@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import base64
+import html as html_module
 from datetime import datetime, date, timedelta
 
 import gspread
@@ -13,11 +15,15 @@ from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from aiohttp import web
 
 # ==================== НАСТРОЙКИ ====================
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берём тільки з env
 FM_SPREADSHEET_ID = "1x-vsC2M1cLtitP2DF04EqkSB4emVwvyh4N3jaauLqZ4"
 EKOL_SPREADSHEET_ID = os.environ.get("EKOL_SPREADSHEET_ID", "")  # поки не налаштовано
+
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+WEB_PORT = int(os.environ.get("PORT", 8080))
 CREDENTIALS_FILE = "credentials.json"
 
 # RAILWAY_VOLUME_MOUNT_PATH встановлюється Railway автоматично, якщо до сервісу
@@ -2505,8 +2511,190 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # інформаційна кнопка (наприклад "✅ Набрано" або ім'я без контакту) — нічого не робимо
 
 
+# ==================== ВЕБ-ДАШБОРД МАРШРУТІВ ====================
+def extract_phone_from_card(text: str):
+    m = re.search(r'📞\s*(.+)$', text.strip())
+    return m.group(1).strip() if m else None
+
+
+def extract_time_minutes(text: str) -> int:
+    m = re.search(r'🕐\s*(\d{1,2}):(\d{2})', text)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    return 99999  # без часу — в кінець списку
+
+
+def telegram_md_to_html(text: str) -> str:
+    escaped = html_module.escape(text)
+    escaped = re.sub(r'\*(.+?)\*', r'<b>\1</b>', escaped)
+    return escaped.replace("\n", "<br>")
+
+
+def build_driver_columns(target_date: date, date_str: str) -> dict:
+    """Групує поставки FM+Ekol на дату по водію (за телефоном) і підвантажує
+    реальні призначення робітників з бази — те, що бачить бот."""
+    all_messages = []
+
+    try:
+        all_values, merged_cells = get_sheet_data(source="fm")
+        routes = parse_routes(all_values, merged_cells)
+        fm_msgs = build_delivery_messages(routes, merged_cells, filter_date=target_date)
+        for m in fm_msgs:
+            m["source"] = "fm"
+        all_messages += fm_msgs
+    except Exception as e:
+        logger.error(f"Дашборд: помилка завантаження FM: {e}", exc_info=True)
+
+    if EKOL_SPREADSHEET_ID:
+        try:
+            all_values_ekol, _ = get_sheet_data(source="ekol")
+            ekol_msgs = parse_ekol_deliveries(all_values_ekol, filter_date=target_date)
+            for m in ekol_msgs:
+                m["source"] = "ekol"
+            all_messages += ekol_msgs
+        except Exception as e:
+            logger.error(f"Дашборд: помилка завантаження Ekol: {e}", exc_info=True)
+
+    columns = {}
+    for m in all_messages:
+        phone = extract_phone_from_card(m["text"]) or "Без номера водія"
+        delivery_key = make_delivery_key(m["source"], m["date_str"], m["text"], needed=m.get("workers_needed"))
+        assigned = db_get_assigned_workers(delivery_key)
+        columns.setdefault(phone, []).append({
+            "text": m["text"],
+            "source": m["source"],
+            "assigned": assigned,
+            "needed": m.get("workers_needed"),
+            "sort_key": extract_time_minutes(m["text"]),
+        })
+
+    for phone in columns:
+        columns[phone].sort(key=lambda x: x["sort_key"])
+
+    return columns
+
+
+DASHBOARD_CSS = """
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#14201A; }
+.header { padding:20px; }
+.header-title { font-size:16px; font-weight:700; }
+.nav { display:flex; align-items:center; gap:12px; margin-top:6px; }
+.nav a { text-decoration:none; color:#2F5D46; font-weight:600; font-size:14px; padding:4px 10px; border-radius:8px; background:#F7F7F4; border:1px solid #ECECE8; }
+.nav span { font-size:13px; color:#6B6B68; }
+.board { display:flex; gap:14px; overflow-x:auto; padding:0 20px 40px; -webkit-overflow-scrolling:touch; }
+.col { flex:0 0 260px; background:#F7F7F4; border:1px solid #ECECE8; border-radius:16px; padding:14px; }
+.col-head { font-size:13px; font-weight:700; margin-bottom:10px; color:#14201A; }
+.card { background:white; border:1px solid #ECECE8; border-radius:12px; padding:10px 12px; margin-bottom:10px; font-size:12.5px; line-height:1.5; }
+.badge { display:inline-block; font-size:10.5px; font-weight:600; padding:2px 8px; border-radius:20px; margin-top:6px; margin-right:4px; }
+.badge.ok { background:#DCE8E0; color:#2F5D46; }
+.badge.need { background:#F5E3D8; color:#8A5E2F; }
+.worker-chip { display:inline-block; font-size:11px; background:#EFEFEA; color:#3D5A46; padding:2px 8px; border-radius:20px; margin:2px 4px 0 0; text-decoration:none; }
+.empty { color:#B0B0AC; font-size:13px; padding:40px 20px; }
+.src { font-size:10px; color:#B0B0AC; }
+"""
+
+
+async def dashboard_handler(request):
+    date_str = request.query.get("date") or date.today().strftime("%d.%m.%Y")
+    try:
+        target_date = datetime.strptime(date_str, "%d.%m.%Y").date()
+    except ValueError:
+        target_date = date.today()
+        date_str = target_date.strftime("%d.%m.%Y")
+
+    prev_date = (target_date - timedelta(days=1)).strftime("%d.%m.%Y")
+    next_date = (target_date + timedelta(days=1)).strftime("%d.%m.%Y")
+
+    columns = build_driver_columns(target_date, date_str)
+
+    cols_html = ""
+    if not columns:
+        cols_html = '<div class="empty">Поставок на цю дату не знайдено.</div>'
+    else:
+        for phone, items in columns.items():
+            cards_html = ""
+            for item in items:
+                assigned = item["assigned"]
+                needed = item["needed"]
+                chips = ""
+                for w in assigned:
+                    if w.get("telegram_id"):
+                        url = f"tg://user?id={w['telegram_id']}"
+                        chips += f'<a class="worker-chip" href="{url}">{html_module.escape(w["name"])}</a>'
+                    elif w.get("username"):
+                        url = f"https://t.me/{w['username']}"
+                        chips += f'<a class="worker-chip" href="{url}">{html_module.escape(w["name"])}</a>'
+                    else:
+                        chips += f'<span class="worker-chip">{html_module.escape(w["name"])}</span>'
+
+                badge = ""
+                if needed:
+                    count = len(assigned)
+                    cls = "ok" if count >= needed else "need"
+                    badge = f'<span class="badge {cls}">{count}/{needed}</span>'
+
+                src_emoji = SOURCE_EMOJI.get(item["source"], "")
+                cards_html += (
+                    f'<div class="card">{telegram_md_to_html(item["text"])}'
+                    f'<div>{badge}{chips}</div>'
+                    f'<div class="src">{src_emoji} {SOURCE_LABEL.get(item["source"], "")}</div></div>'
+                )
+
+            cols_html += f'<div class="col"><div class="col-head">📞 {html_module.escape(phone)}</div>{cards_html}</div>'
+
+    page = f"""<!DOCTYPE html>
+<html lang="uk"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Маршрути водіїв</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>{DASHBOARD_CSS}</style>
+</head><body>
+<div class="header">
+  <div class="header-title">Маршрути водіїв</div>
+  <div class="nav">
+    <a href="/?date={prev_date}">← {prev_date}</a>
+    <span>{date_str}</span>
+    <a href="/?date={next_date}">{next_date} →</a>
+  </div>
+</div>
+<div class="board">{cols_html}</div>
+</body></html>"""
+
+    return web.Response(text=page, content_type="text/html")
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    if not DASHBOARD_PASSWORD:
+        return web.Response(text="Дашборд не налаштовано: відсутня змінна DASHBOARD_PASSWORD.", status=503)
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+            _, _, pwd = decoded.partition(":")
+            if pwd == DASHBOARD_PASSWORD:
+                return await handler(request)
+        except Exception:
+            pass
+
+    return web.Response(
+        status=401,
+        headers={"WWW-Authenticate": 'Basic realm="Dashboard"'},
+        text="Потрібен пароль для доступу."
+    )
+
+
+def build_web_app() -> web.Application:
+    webapp = web.Application(middlewares=[auth_middleware])
+    webapp.router.add_get("/", dashboard_handler)
+    return webapp
+
+
 # ==================== MAIN ====================
-def main():
+async def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("mycities", mycities))
@@ -2526,9 +2714,27 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), group=1)
 
     app.add_handler(CallbackQueryHandler(button_handler))
+
+    webapp = build_web_app()
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    await site.start()
+    logger.info(f"Веб-дашборд запущено на порту {WEB_PORT}")
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     logger.info("Бот запущено!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    try:
+        await asyncio.Event().wait()  # тримаємо процес живим, поки Railway не зупинить його
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
