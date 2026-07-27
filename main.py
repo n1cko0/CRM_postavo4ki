@@ -3,6 +3,8 @@ import logging
 import re
 import difflib
 import hashlib
+import hmac
+import time
 import json
 import os
 import sqlite3
@@ -2576,13 +2578,14 @@ def build_driver_columns(target_date: date, date_str: str) -> dict:
 
 DASHBOARD_CSS = """
 * { margin:0; padding:0; box-sizing:border-box; }
-body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#14201A; }
-.header { padding:20px; }
+html, body { height:100%; overflow:hidden; background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#14201A; }
+.app { display:flex; flex-direction:column; height:100vh; }
+.header { padding:16px 20px; flex-shrink:0; }
 .header-title { font-size:16px; font-weight:700; }
 .nav { display:flex; align-items:center; gap:12px; margin-top:6px; }
 .nav a { text-decoration:none; color:#2F5D46; font-weight:600; font-size:14px; padding:4px 10px; border-radius:8px; background:#F7F7F4; border:1px solid #ECECE8; }
 .nav span { font-size:13px; color:#6B6B68; }
-.board { display:flex; gap:14px; overflow-x:auto; padding:0 20px 40px; -webkit-overflow-scrolling:touch; }
+.board { flex:1; display:flex; align-items:flex-start; gap:14px; overflow:auto; padding:0 20px 40px; -webkit-overflow-scrolling:touch; touch-action:pan-x pan-y; }
 .col { flex:0 0 260px; background:#F7F7F4; border:1px solid #ECECE8; border-radius:16px; padding:14px; }
 .col-head { font-size:13px; font-weight:700; margin-bottom:10px; color:#14201A; }
 .card { background:white; border:1px solid #ECECE8; border-radius:12px; padding:10px 12px; margin-bottom:10px; font-size:12.5px; line-height:1.5; }
@@ -2592,6 +2595,16 @@ body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#
 .worker-chip { display:inline-block; font-size:11px; background:#EFEFEA; color:#3D5A46; padding:2px 8px; border-radius:20px; margin:2px 4px 0 0; text-decoration:none; }
 .empty { color:#B0B0AC; font-size:13px; padding:40px 20px; }
 .src { font-size:10px; color:#B0B0AC; }
+"""
+
+LOGIN_CSS = """
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; }
+.box { background:#F7F7F4; border:1px solid #ECECE8; border-radius:16px; padding:28px; width:280px; }
+.box h1 { font-size:15px; margin-bottom:16px; color:#14201A; }
+.box input { width:100%; padding:10px 12px; border:1px solid #ECECE8; border-radius:10px; font-size:14px; margin-bottom:12px; }
+.box button { width:100%; padding:10px; border:none; border-radius:10px; background:#2F5D46; color:white; font-weight:600; font-size:14px; cursor:pointer; }
+.box .err { color:#B23A3A; font-size:12.5px; margin-bottom:10px; }
 """
 
 
@@ -2651,6 +2664,7 @@ async def dashboard_handler(request):
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{DASHBOARD_CSS}</style>
 </head><body>
+<div class="app">
 <div class="header">
   <div class="header-title">Маршрути водіїв</div>
   <div class="nav">
@@ -2660,9 +2674,63 @@ async def dashboard_handler(request):
   </div>
 </div>
 <div class="board">{cols_html}</div>
+</div>
 </body></html>"""
 
     return web.Response(text=page, content_type="text/html")
+
+
+SESSION_SECRET = os.environ.get("SESSION_SECRET", BOT_TOKEN)
+SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 днів
+
+
+def make_session_token() -> str:
+    expiry = str(int(time.time()) + SESSION_MAX_AGE)
+    sig = hmac.new(SESSION_SECRET.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
+
+
+def verify_session_token(token: str) -> bool:
+    try:
+        expiry, sig = token.split(".", 1)
+        expected = hmac.new(SESSION_SECRET.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        return int(expiry) > int(time.time())
+    except Exception:
+        return False
+
+
+def render_login_page(error: str = "") -> str:
+    err_html = f'<div class="err">{html_module.escape(error)}</div>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="uk"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Вхід</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>{LOGIN_CSS}</style>
+</head><body>
+<form class="box" method="post" action="/login">
+  <h1>Маршрути водіїв</h1>
+  {err_html}
+  <input type="password" name="password" placeholder="Пароль" autofocus>
+  <button type="submit">Увійти</button>
+</form>
+</body></html>"""
+
+
+async def login_handler(request):
+    data = await request.post()
+    pwd = data.get("password", "")
+    if pwd == DASHBOARD_PASSWORD:
+        resp = web.HTTPFound("/")
+        resp.set_cookie(
+            "dashboard_session", make_session_token(),
+            max_age=SESSION_MAX_AGE, httponly=True, samesite="Lax"
+        )
+        return resp
+    return web.Response(text=render_login_page("Невірний пароль"), content_type="text/html")
 
 
 @web.middleware
@@ -2670,26 +2738,20 @@ async def auth_middleware(request, handler):
     if not DASHBOARD_PASSWORD:
         return web.Response(text="Дашборд не налаштовано: відсутня змінна DASHBOARD_PASSWORD.", status=503)
 
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Basic "):
-        try:
-            decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-            _, _, pwd = decoded.partition(":")
-            if pwd == DASHBOARD_PASSWORD:
-                return await handler(request)
-        except Exception:
-            pass
+    if request.path == "/login":
+        return await handler(request)
 
-    return web.Response(
-        status=401,
-        headers={"WWW-Authenticate": 'Basic realm="Dashboard"'},
-        text="Потрібен пароль для доступу."
-    )
+    token = request.cookies.get("dashboard_session", "")
+    if verify_session_token(token):
+        return await handler(request)
+
+    return web.Response(text=render_login_page(), content_type="text/html")
 
 
 def build_web_app() -> web.Application:
     webapp = web.Application(middlewares=[auth_middleware])
     webapp.router.add_get("/", dashboard_handler)
+    webapp.router.add_post("/login", login_handler)
     return webapp
 
 
