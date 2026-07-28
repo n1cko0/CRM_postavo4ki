@@ -1174,23 +1174,6 @@ def format_hours(hours: float) -> str:
     return str(hours)
 
 
-def is_card_number(text: str) -> bool:
-    # 1) швидка перевірка: весь рядок — суцільні цифри (як і раніше)
-    cleaned = re.sub(r'[\s\-]', '', text.strip().lstrip('*').strip())
-    if cleaned.isdigit() and len(cleaned) >= 12:
-        return True
-
-    # 2) карта може бути "прикріплена" до імені/банку в тому ж повідомленні
-    # (наприклад "4149609051317230\nМироненко Дима\nПриват") — шукаємо суцільну
-    # групу цифр/пробілів/дефісів (без літер), яка після очищення дає 12+ цифр
-    for group in re.findall(r'[\d\s\-]{12,}', text):
-        pure = re.sub(r'[\s\-]', '', group)
-        if pure.isdigit() and len(pure) >= 12:
-            return True
-
-    return False
-
-
 def compute_location_data(report_date: str) -> list:
     """Повертає впорядкований список локацій з годинами/кількістю людей/сумою виплат/тарифом/доходом.
     Враховує ручні правки (overrides), якщо вони є."""
@@ -1216,15 +1199,17 @@ def compute_location_data(report_date: str) -> list:
                 'location': payment['location'],
                 'hours': payment['hours'],
                 'za_kilkokh': payment['za_kilkokh'],
-                'cards_count': 0,
+                'confirm_count': 0,
                 'raw_amount': payment['amount'],
             }
         elif current_block:
             wc = parse_workers_count(text)
             if wc:
                 current_block['za_kilkokh'] += wc
-            elif is_card_number(text):
-                current_block['cards_count'] += 1
+            elif text:
+                # будь-яке непорожнє повідомлення після суми — підтвердження оплати
+                # одній людині (карта, ім'я, банк — не важливо, за оплату відповідає сам користувач)
+                current_block['confirm_count'] += 1
 
     if current_block:
         blocks.append(current_block)
@@ -1248,12 +1233,12 @@ def compute_location_data(report_date: str) -> list:
 
         # Скільки людей отримали гроші за цей блок:
         # якщо є мітка "За N" — сума вже загальна на всіх N.
-        # якщо мітки немає — сума вказана ЗА ОДНУ картку, і карток може бути декілька.
+        # якщо мітки немає — сума вказана ЗА ОДНУ людину, і підтверджень (будь-яких повідомлень) може бути декілька.
         if block['za_kilkokh'] > 0:
             block_workers = block['za_kilkokh']
             block_paid = block['raw_amount']
         else:
-            block_workers = block['cards_count'] if block['cards_count'] > 0 else 1
+            block_workers = block['confirm_count'] if block['confirm_count'] > 0 else 1
             block_paid = block['raw_amount'] * block_workers
 
         # (0) годин — це особиста доплата (наприклад водію), яка йде тільки в мінус,
