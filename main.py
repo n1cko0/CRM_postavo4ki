@@ -312,6 +312,21 @@ def db_get_messages(report_date: str) -> list:
     return [{"text": r["text"], "timestamp": r["timestamp"], "message_id": r["message_id"]} for r in rows]
 
 
+def db_update_message_by_id(message_id: int, new_text: str) -> bool:
+    """Оновлює текст вже збереженого повідомлення за його Telegram message_id
+    (для випадку, коли користувач відредагував повідомлення замість того, щоб надіслати нове).
+    Повертає True, якщо запис знайдено й оновлено."""
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE payment_messages SET text = ? WHERE message_id = ?",
+        (new_text, message_id)
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
 def db_list_report_dates() -> list:
     conn = get_conn()
     rows = conn.execute("""
@@ -1160,8 +1175,20 @@ def format_hours(hours: float) -> str:
 
 
 def is_card_number(text: str) -> bool:
+    # 1) швидка перевірка: весь рядок — суцільні цифри (як і раніше)
     cleaned = re.sub(r'[\s\-]', '', text.strip().lstrip('*').strip())
-    return cleaned.isdigit() and len(cleaned) >= 12
+    if cleaned.isdigit() and len(cleaned) >= 12:
+        return True
+
+    # 2) карта може бути "прикріплена" до імені/банку в тому ж повідомленні
+    # (наприклад "4149609051317230\nМироненко Дима\nПриват") — шукаємо суцільну
+    # групу цифр/пробілів/дефісів (без літер), яка після очищення дає 12+ цифр
+    for group in re.findall(r'[\d\s\-]{12,}', text):
+        pure = re.sub(r'[\s\-]', '', group)
+        if pure.isdigit() and len(pure) >= 12:
+            return True
+
+    return False
 
 
 def compute_location_data(report_date: str) -> list:
@@ -1451,6 +1478,38 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except Exception:
         pass
+
+
+async def group_edited_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram надсилає редагування повідомлення окремим типом update (edited_message),
+    не таким самим, як нове повідомлення — тому це окремий обробник."""
+    msg = update.edited_message
+    if not msg or msg.chat.id != REPORT_GROUP_ID:
+        return
+    if msg.from_user.id not in ALLOWED_USERS:
+        return
+
+    text = msg.text or ""
+    if not text or text in BUTTON_TEXTS:
+        return
+
+    updated = db_update_message_by_id(msg.message_id, text)
+    if updated:
+        logger.info(f"Оновлено відредаговане повідомлення {msg.message_id}: {text!r}")
+        return
+
+    # Повідомлення раніше не було збережено (наприклад, редагування прийшло
+    # для чогось, що бот пропустив) — спробуємо додати його як нове,
+    # якщо зараз активно триває збір звіту.
+    user_id = msg.from_user.id
+    if user_id in current_report_date and current_report_date[user_id] != "waiting_date":
+        report_date = current_report_date[user_id]
+        try:
+            timestamp = msg.edit_date.isoformat() if msg.edit_date else datetime.now().isoformat()
+            db_add_message(report_date, text, timestamp, msg.message_id)
+            logger.info(f"Відредаговане повідомлення додано як нове: {msg.message_id}")
+        except Exception as e:
+            logger.error(f"Не вдалося зберегти відредаговане повідомлення: {e}")
 
 
 # ==================== KEYBOARDS ====================
@@ -3003,6 +3062,12 @@ async def main():
     app.add_handler(MessageHandler(
         filters.Chat(REPORT_GROUP_ID) & filters.TEXT & ~filters.COMMAND,
         group_message_handler
+    ), group=0)
+
+    # окреме прослуховування редагувань повідомлень у групі (Telegram шле це іншим типом update)
+    app.add_handler(MessageHandler(
+        filters.Chat(REPORT_GROUP_ID) & filters.TEXT & ~filters.COMMAND & filters.UpdateType.EDITED_MESSAGE,
+        group_edited_message_handler
     ), group=0)
 
     # group=1: этот хендлер получит апдейт независимо от того, что сделал group_message_handler,
