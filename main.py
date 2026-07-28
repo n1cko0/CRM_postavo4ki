@@ -87,8 +87,9 @@ BUTTON_TEXTS = {
 
 # ==================== SQLITE ====================
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -1431,7 +1432,25 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if report_date == "waiting_date":
         return
 
-    db_add_message(report_date, text, msg.date.isoformat(), msg.message_id)
+    for attempt in range(3):
+        try:
+            db_add_message(report_date, text, msg.date.isoformat(), msg.message_id)
+            return
+        except Exception as e:
+            logger.warning(f"Спроба {attempt + 1}: не вдалося зберегти повідомлення оплати: {e}")
+            await asyncio.sleep(0.5)
+
+    logger.error(f"НЕ ЗБЕРЕЖЕНО повідомлення оплати за {report_date}: {text!r}")
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"⚠️ Не вдалося зберегти в звіт за {report_date} це повідомлення:\n\n{text}\n\n"
+                f"Перешли його ще раз у групу."
+            )
+        )
+    except Exception:
+        pass
 
 
 # ==================== KEYBOARDS ====================
