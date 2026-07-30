@@ -1087,20 +1087,25 @@ def parse_payment_message(text: str):
     amount = float(match.group(2).replace(',', '.'))
     hours = float(match.group(3).replace(',', '.'))
 
-    # Ищем "за двох/трьох..." в остальных строках того же сообщения
+    # Ищем "за двох/трьох..." в остальных строках того же сообщения,
+    # а всё остальное (заметки для логістів) зберігаємо як є
     za_kilkokh = 0
+    note_lines = []
     lines = text.strip().split('\n')
     for line in lines[1:]:
-        wc = parse_workers_count(line.strip())
+        stripped = line.strip()
+        wc = parse_workers_count(stripped)
         if wc:
             za_kilkokh = wc
-            break
+        elif stripped:
+            note_lines.append(stripped)
 
     return {
         'location': location,
         'amount': amount,  # сколько реально заплачено вантажникам за цей блок
         'hours': hours,
         'za_kilkokh': za_kilkokh,
+        'note': '\n'.join(note_lines),
     }
 
 
@@ -1171,7 +1176,7 @@ def guess_city(raw: str, cities: dict) -> str:
 def format_hours(hours: float) -> str:
     if hours == int(hours):
         return str(int(hours))
-    return str(hours)
+    return str(hours).replace('.', ',')
 
 
 def format_money(amount: float) -> str:
@@ -1210,6 +1215,7 @@ def compute_location_data(report_date: str) -> list:
                 'za_kilkokh': payment['za_kilkokh'],
                 'confirm_count': 0,
                 'raw_amount': payment['amount'],
+                'note': payment.get('note', ''),
             }
         elif current_block:
             wc = parse_workers_count(text)
@@ -1234,6 +1240,7 @@ def compute_location_data(report_date: str) -> list:
                 'hours': block['hours'] if block['hours'] > 0 else 0,
                 'total_workers': 0,
                 'paid_to_workers': 0.0,
+                'notes': [],
             }
             grouped_order.append(loc)
         elif grouped[loc]['hours'] == 0 and block['hours'] > 0:
@@ -1256,6 +1263,9 @@ def compute_location_data(report_date: str) -> list:
             grouped[loc]['total_workers'] += block_workers
 
         grouped[loc]['paid_to_workers'] += block_paid
+
+        if block.get('note'):
+            grouped[loc]['notes'].append(block['note'])
 
     # Застосовуємо ручні правки (якщо є)
     for loc in grouped_order:
@@ -1286,6 +1296,7 @@ def compute_location_data(report_date: str) -> list:
             'paid_to_workers': data['paid_to_workers'],
             'rate': my_rate,
             'income': my_total,
+            'note': '\n'.join(data['notes']),
             'edited': loc in overrides,
         })
 
@@ -1323,6 +1334,8 @@ def build_report_and_stats(report_date: str):
             report_text = f"{loc} по {format_money(my_total)} ({hours_str})\n{label}"
         else:
             report_text = f"{loc} по {format_money(my_total)} ({hours_str})"
+        if item.get('note'):
+            report_text += f"\n{item['note']}"
         reports.append(report_text)
 
         total_paid += paid
