@@ -1174,6 +1174,15 @@ def format_hours(hours: float) -> str:
     return str(hours)
 
 
+def format_money(amount: float) -> str:
+    """Точна сума грн: ціле число без дробової частини, або з копійками через кому
+    (797,5), без жодного округлення чи втрати копійок."""
+    if amount == int(amount):
+        return str(int(amount))
+    formatted = f"{amount:.2f}".rstrip('0').rstrip('.')
+    return formatted.replace('.', ',')
+
+
 def compute_location_data(report_date: str) -> list:
     """Повертає впорядкований список локацій з годинами/кількістю людей/сумою виплат/тарифом/доходом.
     Враховує ручні правки (overrides), якщо вони є."""
@@ -1311,9 +1320,9 @@ def build_report_and_stats(report_date: str):
         hours_str = format_hours(hours)
         if total_workers > 1:
             label = workers_ua.get(total_workers, f'За {total_workers}')
-            report_text = f"{loc} по {int(my_total)} ({hours_str})\n{label}"
+            report_text = f"{loc} по {format_money(my_total)} ({hours_str})\n{label}"
         else:
-            report_text = f"{loc} по {int(my_total)} ({hours_str})"
+            report_text = f"{loc} по {format_money(my_total)} ({hours_str})"
         reports.append(report_text)
 
         total_paid += paid
@@ -1361,12 +1370,12 @@ def format_stats_message(report_date: str, stats: dict) -> str:
     lines = [f"📊 *Статистика за {report_date}*", ""]
     lines.append(f"*{stats['total_deliveries']} поставок*")
     lines.append("")
-    lines.append(f"💸 Заплачено вантажникам: {int(stats['total_paid'])} грн")
-    lines.append(f"💰 Отримаю за роботу: {int(stats['total_income'])} грн")
+    lines.append(f"💸 Заплачено вантажникам: {format_money(stats['total_paid'])} грн")
+    lines.append(f"💰 Отримаю за роботу: {format_money(stats['total_income'])} грн")
 
     profit = stats['total_profit']
     emoji = "📈" if profit >= 0 else "📉"
-    lines.append(f"{emoji} Чистий прибуток: {int(profit)} грн")
+    lines.append(f"{emoji} Чистий прибуток: {format_money(profit)} грн")
 
     if stats['total_manhours'] > 0:
         lines.append(f"⏱ Людино-годин відпрацьовано: {stats['total_manhours']:.1f}")
@@ -1376,11 +1385,11 @@ def format_stats_message(report_date: str, stats: dict) -> str:
         lines.append("")
         lines.append("🏙 *Міста за прибутковістю:*")
         for i, c in enumerate(stats['cities'], start=1):
-            lines.append(f"{i}. {c['city']} — {int(c['profit'])} грн")
+            lines.append(f"{i}. {c['city']} — {format_money(c['profit'])} грн")
             if len(c['entries']) > 1:
                 for entry in c['entries']:
                     sign = "+" if entry['profit'] >= 0 else ""
-                    lines.append(f"    • {entry['label']} — {sign}{int(entry['profit'])} грн")
+                    lines.append(f"    • {entry['label']} — {sign}{format_money(entry['profit'])} грн")
 
     return "\n".join(lines)
 
@@ -2210,7 +2219,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         for idx, item in enumerate(locations):
             mark = "✏️ " if item['edited'] else ""
-            label = f"{mark}{item['location']} — {int(item['income'])} грн ({item['total_workers']} люд.)"
+            label = f"{mark}{item['location']} — {format_money(item['income'])} грн ({item['total_workers']} люд.)"
             if len(label) > 64:
                 label = label[:61] + "..."
             keyboard.append([InlineKeyboardButton(label, callback_data=f"rloc_{d}_{idx}")])
@@ -2233,8 +2242,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📍 {item['location']}\n\n"
             f"⏱ Години: {format_hours(item['hours'])}\n"
             f"👷 Кількість людей: {item['total_workers']}\n"
-            f"💸 Сума виплат: {int(item['paid_to_workers'])} грн\n"
-            f"💰 Дохід (за тарифом): {int(item['income'])} грн"
+            f"💸 Сума виплат: {format_money(item['paid_to_workers'])} грн\n"
+            f"💰 Дохід (за тарифом): {format_money(item['income'])} грн"
         )
         keyboard = [
             [InlineKeyboardButton("⏱ Змінити години", callback_data=f"rf_{d}_{idx}_hours")],
