@@ -1444,30 +1444,45 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     msg = update.message
     if not msg or msg.chat.id != REPORT_GROUP_ID:
         return
-    if msg.from_user.id not in ALLOWED_USERS:
+
+    sender = msg.from_user
+    sender_id = sender.id if sender else None
+    sender_name = sender.full_name if sender else "(немає from_user — можливо, анонім/канал)"
+    text_preview = (msg.text or "")[:60]
+    logger.info(f"[group_msg] отримано від {sender_name} (id={sender_id}): {text_preview!r}")
+
+    if sender is None or sender_id not in ALLOWED_USERS:
+        logger.info(f"[group_msg] ІГНОРУЮ: sender_id={sender_id} не в ALLOWED_USERS={ALLOWED_USERS}")
         return
 
     text = msg.text or ""
     if not text:
+        logger.info("[group_msg] ІГНОРУЮ: порожній текст (не текстове повідомлення)")
         return
     if text in BUTTON_TEXTS:
-        return  # это нажатие кнопки меню, а не оплата — не перехватываем
+        logger.info(f"[group_msg] ІГНОРУЮ: це кнопка меню ({text!r})")
+        return
 
-    user_id = msg.from_user.id
+    user_id = sender_id
     if user_id in edit_state:
-        return  # це введення нового значення при редагуванні позиції, а не оплата
+        logger.info(f"[group_msg] ІГНОРУЮ: user {user_id} зараз у edit_state")
+        return
     if user_id in worker_flow_state:
-        return  # це введення даних працівника, а не оплата
+        logger.info(f"[group_msg] ІГНОРУЮ: user {user_id} зараз у worker_flow_state")
+        return
     if user_id not in current_report_date:
+        logger.info(f"[group_msg] ІГНОРУЮ: user {user_id} не обирав дату звіту (current_report_date порожній)")
         return
 
     report_date = current_report_date[user_id]
     if report_date == "waiting_date":
+        logger.info(f"[group_msg] ІГНОРУЮ: user {user_id} ще вводить дату (waiting_date)")
         return
 
     for attempt in range(3):
         try:
             db_add_message(report_date, text, msg.date.isoformat(), msg.message_id)
+            logger.info(f"[group_msg] ✅ ЗБЕРЕЖЕНО за {report_date}: {text_preview!r}")
             return
         except Exception as e:
             logger.warning(f"Спроба {attempt + 1}: не вдалося зберегти повідомлення оплати: {e}")
