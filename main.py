@@ -55,10 +55,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-current_report_date = {}
+current_report_date = {}  # user_id -> "дд.мм.рррр" | "waiting_date" ; дублюється в user_state (SQLite), щоб переживати рестарт
 edit_state = {}  # user_id -> {"date": ..., "location": ..., "field": "hours"|"workers"|"paid"}
 worker_flow_state = {}  # user_id -> {"mode": "add_name"|"add_phone"|"add_username"|"add_card"|"edit_field", ...}
 anketa_state = {}  # user_id -> {"step": "name"|"age"|"phone", "data": {...}} — для незнайомих людей (не ALLOWED_USERS)
+
+
+def set_report_date(user_id: int, value: str):
+    """Записує вибрану дату звіту одразу і в пам'ять, і в БД —
+    щоб вона не губилась при рестарті бота (Railway може перезапускати сервіс сам)."""
+    current_report_date[user_id] = value
+    db_set_user_report_date(user_id, value)
 
 WORKER_FIELD_LABELS = {
     "name": "ім'я",
@@ -177,6 +184,12 @@ def init_db():
             total_workers INTEGER,
             paid_to_workers REAL,
             PRIMARY KEY (report_date, location)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_state (
+            user_id INTEGER PRIMARY KEY,
+            report_date TEXT
         )
     """)
     conn.commit()
@@ -391,6 +404,24 @@ def db_delete_override(report_date: str, location: str):
     )
     conn.commit()
     conn.close()
+
+
+def db_set_user_report_date(user_id: int, report_date: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO user_state (user_id, report_date) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET report_date = excluded.report_date",
+        (user_id, report_date)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_load_user_states() -> dict:
+    conn = get_conn()
+    rows = conn.execute("SELECT user_id, report_date FROM user_state").fetchall()
+    conn.close()
+    return {r["user_id"]: r["report_date"] for r in rows}
 
 
 # ==================== РОБІТНИКИ ====================
@@ -751,6 +782,7 @@ def db_dismiss_contact(telegram_id: int):
 
 init_db()
 migrate_json_to_db()
+current_report_date.update(db_load_user_states())
 
 
 # ==================== GOOGLE SHEETS ====================
@@ -2036,7 +2068,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text_input = update.message.text.strip()
         try:
             datetime.strptime(text_input, "%d.%m.%Y")
-            current_report_date[user_id] = text_input
+            set_report_date(user_id, text_input)
             keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
             await update.message.reply_text(
                 f"✅ Дата звіту: {text_input}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -2146,7 +2178,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "report_yesterday":
         d = (date.today() - timedelta(days=1)).strftime("%d.%m.%Y")
-        current_report_date[query.from_user.id] = d
+        set_report_date(query.from_user.id, d)
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
             f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -2155,7 +2187,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "report_today":
         d = date.today().strftime("%d.%m.%Y")
-        current_report_date[query.from_user.id] = d
+        set_report_date(query.from_user.id, d)
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
             f"✅ Дата звіту: {d}\n\nТепер скидайте оплати в групу.\nКоли закінчите — натисніть кнопку нижче.",
@@ -2163,7 +2195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "report_custom":
-        current_report_date[query.from_user.id] = "waiting_date"
+        set_report_date(query.from_user.id, "waiting_date")
         await query.edit_message_text("Введіть дату у форматі ДД.ММ.РРРР:")
 
     elif data == "build_report":
