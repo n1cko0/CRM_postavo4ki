@@ -11,6 +11,7 @@ import sqlite3
 import base64
 import html as html_module
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -38,6 +39,14 @@ DB_FILE = os.path.join(DATA_DIR, "postavo4ki.db")
 ALLOWED_USERS = [7305470549, 506094120]
 REPORT_GROUP_ID = -5344273524
 MY_CARD_NUMBER = "4441111134286644"
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def kyiv_today() -> date:
+    """'Сьогодні' саме по київському часу, а не по часовому поясу сервера
+    (Railway працює в UTC, тому звичайний date.today() там відставав би на 2-3 години опівночі)."""
+    return datetime.now(KYIV_TZ).date()
 
 # Міста, які треба виключити саме з парсингу FM (наприклад через однойменне
 # але зовсім інше місто в тій же колонці "Місто" — реальний Миколаїв ведеться
@@ -2152,17 +2161,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("dlv_today_"):
         source = data.replace("dlv_today_", "")
-        await send_deliveries_query(query, context, source=source, filter_date=date.today())
+        await send_deliveries_query(query, context, source=source, filter_date=kyiv_today())
 
     elif data.startswith("dlv_tomorrow_"):
         source = data.replace("dlv_tomorrow_", "")
-        await send_deliveries_query(query, context, source=source, filter_date=date.today() + timedelta(days=1))
+        await send_deliveries_query(query, context, source=source, filter_date=kyiv_today() + timedelta(days=1))
 
     elif data.startswith("dlv_pick_"):
         source = data.replace("dlv_pick_", "")
         keyboard = []
         for i in range(7):
-            d = date.today() + timedelta(days=i)
+            d = kyiv_today() + timedelta(days=i)
             label = d.strftime("%d.%m.%Y")
             keyboard.append([InlineKeyboardButton(label, callback_data=f"date_{label}_{source}")])
         await query.edit_message_text("Оберіть дату:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -2177,7 +2186,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Помилка дати")
 
     elif data == "report_yesterday":
-        d = (date.today() - timedelta(days=1)).strftime("%d.%m.%Y")
+        d = (kyiv_today() - timedelta(days=1)).strftime("%d.%m.%Y")
         set_report_date(query.from_user.id, d)
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
@@ -2186,7 +2195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "report_today":
-        d = date.today().strftime("%d.%m.%Y")
+        d = kyiv_today().strftime("%d.%m.%Y")
         set_report_date(query.from_user.id, d)
         keyboard = [[InlineKeyboardButton("📋 Сформувати звіт", callback_data="build_report")]]
         await query.edit_message_text(
@@ -2831,11 +2840,11 @@ body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; display
 
 
 async def dashboard_handler(request):
-    date_str = request.query.get("date") or date.today().strftime("%d.%m.%Y")
+    date_str = request.query.get("date") or kyiv_today().strftime("%d.%m.%Y")
     try:
         target_date = datetime.strptime(date_str, "%d.%m.%Y").date()
     except ValueError:
-        target_date = date.today()
+        target_date = kyiv_today()
         date_str = target_date.strftime("%d.%m.%Y")
 
     prev_date = (target_date - timedelta(days=1)).strftime("%d.%m.%Y")
