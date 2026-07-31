@@ -89,7 +89,6 @@ BUTTON_TEXTS = {
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -3066,8 +3065,10 @@ async def main():
     app.add_handler(CommandHandler("removealias", removealias))
 
     # group=0: сначала пробуем перехватить сообщение в группе как "оплату"
+    # (UpdateType.MESSAGE — явно тільки НОВІ повідомлення, інакше цей хендлер
+    # перехоплював би й редагування раніше, ніж group_edited_message_handler)
     app.add_handler(MessageHandler(
-        filters.Chat(REPORT_GROUP_ID) & filters.TEXT & ~filters.COMMAND,
+        filters.Chat(REPORT_GROUP_ID) & filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE,
         group_message_handler
     ), group=0)
 
