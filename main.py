@@ -37,7 +37,7 @@ CITIES_FILE = os.path.join(DATA_DIR, "cities.json")       # тільки для 
 REPORTS_FILE = os.path.join(DATA_DIR, "reports.json")     # тільки для одноразової міграції
 DB_FILE = os.path.join(DATA_DIR, "postavo4ki.db")
 ALLOWED_USERS = [7305470549, 506094120]
-REPORT_GROUP_ID = -5344273524
+REPORT_GROUP_ID = -1004382686176  # оновлено 01.08.2026: групу "Оплати" сконвертувало в супергрупу, старий ID (-5344273524) більше не діє
 MY_CARD_NUMBER = "4441111134286644"
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -1540,22 +1540,6 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except Exception:
         pass
-
-
-async def debug_log_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тимчасовий діагностичний хендлер: логує chat_id/тип/назву АБСОЛЮТНО будь-якого
-    повідомлення з будь-якого чату, без жодних фільтрів — щоб перевірити, чи справді
-    REPORT_GROUP_ID досі відповідає реальному ID робочої групи (могло змінитись,
-    якщо групу конвертувало в супергрупу)."""
-    msg = update.effective_message
-    if not msg:
-        return
-    chat = msg.chat
-    text_preview = (msg.text or "")[:50]
-    logger.info(
-        f"[debug_all] chat_id={chat.id} type={chat.type} title={getattr(chat, 'title', None)!r} "
-        f"text={text_preview!r} (REPORT_GROUP_ID зараз = {REPORT_GROUP_ID})"
-    )
 
 
 async def group_edited_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3153,10 +3137,6 @@ async def main():
     # group=1: этот хендлер получит апдейт независимо от того, что сделал group_message_handler,
     # поэтому кнопки в группе тоже обрабатываются
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler), group=1)
-
-    # group=99: ТИМЧАСОВИЙ діагностичний хендлер — жодних фільтрів, логує все підряд.
-    # Прибрати після того, як з'ясуємо реальний chat_id робочої групи.
-    app.add_handler(MessageHandler(filters.ALL, debug_log_all_handler), group=99)
 
     app.add_handler(CallbackQueryHandler(button_handler))
 
