@@ -4,7 +4,7 @@ import html as html_module
 import os
 import re
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 
 from aiohttp import web
 
@@ -14,11 +14,6 @@ import parsing
 
 
 # ==================== ВЕБ-ДАШБОРД МАРШРУТІВ ====================
-def extract_phone_from_card(text: str):
-    m = re.search(r'📞\s*(.+)$', text.strip())
-    return m.group(1).strip() if m else None
-
-
 def extract_time_minutes(text: str) -> int:
     m = re.search(r'🕐\s*(\d{1,2}):(\d{2})', text)
     if m:
@@ -32,7 +27,10 @@ def telegram_md_to_html(text: str) -> str:
     return escaped.replace("\n", "<br>")
 
 
-def build_driver_columns(target_date: date, date_str: str) -> dict:
+DRIVER_COLORS = ["#2F5D46", "#3D5A73", "#8A5E74", "#8A6F2F", "#5E5A8A", "#2F7A6B", "#7A4A4A"]
+
+
+def build_driver_columns(date_str: str) -> dict:
     """Групує поставки на дату по водію (за телефоном) і підвантажує
     реальні призначення робітників з бази — те, що бачить бот."""
     deliveries = db.db_get_deliveries(delivery_date=date_str)
@@ -57,116 +55,105 @@ def build_driver_columns(target_date: date, date_str: str) -> dict:
     return columns
 
 
-PX_PER_HOUR = 110
-CARD_CENTER_OFFSET = 56  # приблизна половина висоти картки — щоб нитка проходила саме через центр
-MIN_CARD_GAP = 110       # мінімальна відстань по вертикалі між сусідніми картками одного водія
-HEADER_OFFSET = 44       # місце під заголовок колонки (номер водія) над першою карткою
-DRIVER_COLORS = ["#2F5D46", "#3D5A73", "#8A5E74", "#8A6F2F", "#5E5A8A", "#2F7A6B", "#7A4A4A"]
+def build_flat_list(date_str: str) -> list:
+    """Всі поставки дня в одному хронологічному списку (без групування по водію) —
+    для загальної картини дня цілком."""
+    deliveries = db.db_get_deliveries(delivery_date=date_str)
+    items = []
+    for d in deliveries:
+        text = parsing.format_delivery_card(d)
+        assigned = db.db_get_assigned_workers(d["id"])
+        items.append({
+            "delivery_id": d["id"],
+            "text": text,
+            "source": d["source"],
+            "phone": d.get("driver_phone") or "Без номера водія",
+            "assigned": assigned,
+            "needed": d.get("workers_needed"),
+            "sort_key": extract_time_minutes(text),
+        })
+    items.sort(key=lambda x: x["sort_key"])
+    return items
 
 
-def compute_time_range(columns: dict):
-    minutes = [it["sort_key"] for items in columns.values() for it in items if it["sort_key"] < 99999]
-    if not minutes:
-        return 6 * 60, 20 * 60
-    lo = max(0, (min(minutes) // 60) * 60 - 60)
-    hi = min(24 * 60, ((max(minutes) // 60) + 1) * 60 + 60)
-    if hi - lo < 120:
-        hi = lo + 120
-    return lo, hi
+def render_card_inner(item: dict, color: str = None) -> str:
+    """Спільна розмітка вмісту картки (бейдж призначення + чіпи людей) —
+    використовується і в колонках, і в хронологічному списку."""
+    assigned = item["assigned"]
+    needed = item["needed"]
+    chips = ""
+    for w in assigned:
+        if w.get("telegram_id"):
+            url = f"tg://user?id={w['telegram_id']}"
+            chips += f'<a class="worker-chip" href="{url}">{html_module.escape(w["name"])}</a>'
+        elif w.get("username"):
+            url = f"https://t.me/{w['username']}"
+            chips += f'<a class="worker-chip" href="{url}">{html_module.escape(w["name"])}</a>'
+        else:
+            chips += f'<span class="worker-chip">{html_module.escape(w["name"])}</span>'
 
+    badge = ""
+    if needed:
+        count = len(assigned)
+        cls = "ok" if count >= needed else "need"
+        badge = f'<span class="badge {cls}">{count}/{needed}</span>'
 
-def assign_card_positions(columns: dict, lo: int) -> float:
-    """Проставляє item['top'] (у пікселях, без урахування HEADER_OFFSET) для кожної картки.
-    Повертає найбільший 'top' серед усіх колонок."""
-    overall_max = 0.0
-    for phone, items in columns.items():
-        with_time = [it for it in items if it["sort_key"] < 99999]
-        without_time = [it for it in items if it["sort_key"] >= 99999]
-
-        prev_top = None
-        for it in with_time:
-            top = (it["sort_key"] - lo) / 60 * PX_PER_HOUR
-            if prev_top is not None and top < prev_top + MIN_CARD_GAP:
-                top = prev_top + MIN_CARD_GAP
-            it["top"] = top
-            prev_top = top
-
-        next_top = (prev_top + MIN_CARD_GAP) if prev_top is not None else 0.0
-        for it in without_time:
-            it["top"] = next_top
-            next_top += MIN_CARD_GAP
-
-        col_items = with_time + without_time
-        if col_items:
-            overall_max = max(overall_max, max(it["top"] for it in col_items))
-
-    return overall_max
-
-
-def build_ruler_html(lo: int, hi: int, total_height: float) -> str:
-    step = 60 if (hi - lo) <= 14 * 60 else 120
-    ticks = ""
-    m = lo
-    while m <= hi:
-        top = HEADER_OFFSET + (m - lo) / 60 * PX_PER_HOUR
-        ticks += f'<div class="tick" style="top:{top}px;">{m // 60:02d}:{m % 60:02d}</div>'
-        m += step
-
-    periods = [
-        ("РАНОК", lo, min(hi, 11 * 60)),
-        ("ДЕНЬ", max(lo, 11 * 60), min(hi, 17 * 60)),
-        ("ВЕЧІР", max(lo, 17 * 60), hi),
-    ]
-    period_html = ""
-    for label, seg_lo, seg_hi in periods:
-        if seg_hi > seg_lo:
-            mid = (seg_lo + seg_hi) / 2
-            top = HEADER_OFFSET + (mid - lo) / 60 * PX_PER_HOUR
-            period_html += f'<div class="period" style="top:{top}px;">{label}</div>'
-
-    return f'<div class="ruler" style="height:{total_height}px;">{period_html}{ticks}</div>'
+    src_emoji = config.SOURCE_EMOJI.get(item["source"], "")
+    style = f' style="border-left-color:{color};"' if color else ""
+    return (
+        f'<div class="card"{style}>{telegram_md_to_html(item["text"])}'
+        f'<div>{badge}{chips}</div>'
+        f'<div class="src">{src_emoji} {config.SOURCE_LABEL.get(item["source"], "")}</div></div>'
+    )
 
 
 DASHBOARD_CSS = """
 * { margin:0; padding:0; box-sizing:border-box; }
-html, body { height:100%; overflow:hidden; background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#14201A; }
+html, body { height:100%; background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; color:#14201A; }
 .app { display:flex; flex-direction:column; height:100vh; }
 .header { padding:16px 20px; flex-shrink:0; }
 .header-title { font-size:16px; font-weight:700; }
-.nav { display:flex; align-items:center; gap:12px; margin-top:6px; }
+.nav { display:flex; align-items:center; gap:12px; margin-top:6px; flex-wrap:wrap; }
 .nav a { text-decoration:none; color:#2F5D46; font-weight:600; font-size:14px; padding:4px 10px; border-radius:8px; background:#F7F7F4; border:1px solid #ECECE8; }
 .nav span { font-size:13px; color:#6B6B68; }
+.view-switch { display:flex; gap:6px; padding:0 20px 12px; flex-shrink:0; }
+.view-switch a { text-decoration:none; font-size:13px; font-weight:600; padding:6px 14px; border-radius:20px; border:1px solid #ECECE8; color:#6B6B68; background:#F7F7F4; }
+.view-switch a.active { background:#14201A; color:white; border-color:#14201A; }
+
+/* ==== вид "колонки по водіям" ==== */
 .board { flex:1; overflow:auto; -webkit-overflow-scrolling:touch; touch-action:pan-x pan-y; position:relative; background:#E9E9E7; }
 .board-spacer { position:relative; }
 .board-inner {
-  position:absolute; top:0; left:0; display:flex; align-items:flex-start; gap:14px; padding:20px 20px 40px;
+  position:absolute; top:0; left:0; display:flex; align-items:flex-start; gap:14px; padding:4px 20px 40px;
   transform-origin:0 0; will-change:transform;
   background-image: radial-gradient(circle, #D6D6D0 1.6px, transparent 1.6px);
   background-size: 22px 22px;
   background-position: 6px 6px;
 }
-.ruler { flex:0 0 56px; position:relative; }
-.ruler .tick { position:absolute; left:0; right:8px; text-align:right; font-size:10.5px; color:#ADADA8; font-weight:500; transform:translateY(-50%); white-space:nowrap; }
-.ruler .tick::after { content:''; position:absolute; right:-8px; top:50%; width:6px; height:1px; background:#C7C7C1; }
-.ruler .period { position:absolute; left:0; font-size:9px; letter-spacing:0.1em; color:#B7B7B0; font-weight:700; writing-mode:vertical-rl; text-orientation:mixed; transform:translateY(-50%); }
-.col { flex:0 0 250px; position:relative; }
+.col { flex:0 0 250px; }
 .col-head { font-size:13px; font-weight:700; padding:8px 6px; color:#14201A; }
+.zoom-controls { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:20; }
+.zoom-controls button { width:42px; height:42px; border-radius:50%; border:1px solid #ECECE8; background:white; font-size:19px; box-shadow:0 2px 10px rgba(0,0,0,0.12); cursor:pointer; color:#14201A; }
+.zoom-controls button:active { background:#F0F0EC; }
+
+/* ==== вид "хронологічно" (звичайний список, без зуму) ==== */
+.list-wrap { flex:1; overflow-y:auto; padding:4px 20px 60px; -webkit-overflow-scrolling:touch; }
+.list-item { margin-bottom:12px; }
+.list-time { font-size:11px; font-weight:700; color:#8A8A86; margin-bottom:4px; padding-left:2px; }
+.driver-tag { display:inline-block; font-size:10.5px; font-weight:600; color:white; padding:2px 8px; border-radius:20px; margin-bottom:6px; }
+
+/* ==== картка (спільна для обох видів) ==== */
 .card {
-  position:absolute; left:6px; right:6px; z-index:2;
   background:#F7F7F4; border:1px solid #ECECE8; border-radius:12px; border-left-width:3px;
-  padding:10px 12px; font-size:12.5px; line-height:1.5;
+  padding:10px 12px; font-size:12.5px; line-height:1.5; margin-bottom:10px;
   box-shadow:0 1px 2px rgba(0,0,0,0.03), 0 4px 10px rgba(0,0,0,0.04);
 }
-.thread { position:absolute; left:calc(50% - 1px); width:2px; z-index:1; border-radius:2px; opacity:0.55; }
 .badge { display:inline-block; font-size:10.5px; font-weight:600; padding:2px 8px; border-radius:20px; margin-top:6px; margin-right:4px; }
 .badge.ok { background:#DCE8E0; color:#2F5D46; }
 .badge.need { background:#F5E3D8; color:#8A5E2F; }
 .worker-chip { display:inline-block; font-size:11px; background:#EFEFEA; color:#3D5A46; padding:2px 8px; border-radius:20px; margin:2px 4px 0 0; text-decoration:none; }
 .empty { color:#B0B0AC; font-size:13px; padding:40px 20px; }
 .src { font-size:10px; color:#B0B0AC; }
-.zoom-controls { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:20; }
-.zoom-controls button { width:42px; height:42px; border-radius:50%; border:1px solid #ECECE8; background:white; font-size:19px; box-shadow:0 2px 10px rgba(0,0,0,0.12); cursor:pointer; color:#14201A; }
-.zoom-controls button:active { background:#F0F0EC; }
 """
 
 LOGIN_CSS = """
@@ -180,76 +167,174 @@ body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; display
 """
 
 
+def render_columns_view(date_str: str) -> str:
+    columns = build_driver_columns(date_str)
+    if not columns:
+        return '<div class="empty">Поставок на цю дату не знайдено.</div>'
+
+    cols_html = ""
+    for col_idx, (phone, items) in enumerate(columns.items()):
+        color = DRIVER_COLORS[col_idx % len(DRIVER_COLORS)]
+        cards_html = "".join(render_card_inner(it, color) for it in items)
+        cols_html += (
+            f'<div class="col"><div class="col-head">📞 {html_module.escape(phone)}</div>{cards_html}</div>'
+        )
+
+    return f"""<div class="board" id="board">
+  <div class="board-spacer" id="boardSpacer">
+    <div class="board-inner" id="boardInner">{cols_html}</div>
+  </div>
+</div>
+<div class="zoom-controls">
+  <button id="zoomIn" aria-label="Наблизити">+</button>
+  <button id="zoomOut" aria-label="Віддалити">−</button>
+  <button id="zoomFit" aria-label="Показати все">⤢</button>
+</div>"""
+
+
+def render_list_view(date_str: str) -> str:
+    items = build_flat_list(date_str)
+    if not items:
+        return '<div class="empty">Поставок на цю дату не знайдено.</div>'
+
+    phone_colors = {}
+    rows_html = ""
+    for item in items:
+        phone = item["phone"]
+        if phone not in phone_colors:
+            phone_colors[phone] = DRIVER_COLORS[len(phone_colors) % len(DRIVER_COLORS)]
+        color = phone_colors[phone]
+        time_label = item["text"]
+        m = re.search(r'🕐\s*(\d{1,2}:\d{2})', item["text"])
+        time_label = m.group(1) if m else "без часу"
+
+        rows_html += (
+            f'<div class="list-item">'
+            f'<div class="list-time">{time_label}</div>'
+            f'<span class="driver-tag" style="background:{color};">📞 {html_module.escape(phone)}</span>'
+            f'{render_card_inner(item, color)}'
+            f'</div>'
+        )
+
+    return f'<div class="list-wrap">{rows_html}</div>'
+
+
+ZOOM_SCRIPT = """
+(function() {
+  var board = document.getElementById('board');
+  if (!board) return;
+  var spacer = document.getElementById('boardSpacer');
+  var inner = document.getElementById('boardInner');
+
+  var zoom = 1, minZoom = 0.3, maxZoom = 2.5;
+  var naturalW = 0, naturalH = 0;
+
+  function measure() {
+    inner.style.transform = 'scale(1)';
+    naturalW = inner.scrollWidth;
+    naturalH = inner.scrollHeight;
+  }
+
+  function applyZoom(z, focalX, focalY) {
+    z = Math.min(maxZoom, Math.max(minZoom, z));
+    var ratio = z / zoom;
+    var beforeX = (focalX !== undefined) ? board.scrollLeft + focalX : 0;
+    var beforeY = (focalY !== undefined) ? board.scrollTop + focalY : 0;
+    zoom = z;
+    spacer.style.width = (naturalW * zoom) + 'px';
+    spacer.style.height = (naturalH * zoom) + 'px';
+    inner.style.transform = 'scale(' + zoom + ')';
+    if (focalX !== undefined) {
+      board.scrollLeft = beforeX * ratio - focalX;
+      board.scrollTop = beforeY * ratio - focalY;
+    }
+  }
+
+  function fitAll() {
+    var fitZoom = Math.min(board.clientWidth / naturalW, board.clientHeight / naturalH);
+    minZoom = Math.min(fitZoom, 1);
+    applyZoom(fitZoom);
+    board.scrollLeft = 0;
+    board.scrollTop = 0;
+  }
+
+  function dist(t1, t2) {
+    return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+  }
+
+  window.addEventListener('load', function() {
+    measure();
+    var fitZoom = Math.min(board.clientWidth / naturalW, board.clientHeight / naturalH);
+    minZoom = Math.min(fitZoom, 1);
+    applyZoom(1);
+  });
+
+  var pinchStartDist = null, pinchStartZoom = 1;
+
+  board.addEventListener('touchstart', function(e) {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      pinchStartDist = dist(e.touches[0], e.touches[1]);
+      pinchStartZoom = zoom;
+    }
+  }, {passive:false});
+
+  board.addEventListener('touchmove', function(e) {
+    if (e.touches.length === 2 && pinchStartDist) {
+      e.preventDefault();
+      var d = dist(e.touches[0], e.touches[1]);
+      var factor = d / pinchStartDist;
+      var rect = board.getBoundingClientRect();
+      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+      var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+      applyZoom(pinchStartZoom * factor, midX, midY);
+    }
+  }, {passive:false});
+
+  board.addEventListener('touchend', function(e) {
+    if (e.touches.length < 2) pinchStartDist = null;
+  });
+
+  board.addEventListener('wheel', function(e) {
+    if (e.ctrlKey) {
+      e.preventDefault();
+      var rect = board.getBoundingClientRect();
+      applyZoom(zoom * (e.deltaY < 0 ? 1.1 : 0.9), e.clientX - rect.left, e.clientY - rect.top);
+    }
+  }, {passive:false});
+
+  var zoomInBtn = document.getElementById('zoomIn');
+  var zoomOutBtn = document.getElementById('zoomOut');
+  var zoomFitBtn = document.getElementById('zoomFit');
+  if (zoomInBtn) zoomInBtn.onclick = function() { applyZoom(zoom * 1.3, board.clientWidth / 2, board.clientHeight / 2); };
+  if (zoomOutBtn) zoomOutBtn.onclick = function() { applyZoom(zoom / 1.3, board.clientWidth / 2, board.clientHeight / 2); };
+  if (zoomFitBtn) zoomFitBtn.onclick = fitAll;
+})();
+"""
+
+
 async def dashboard_handler(request):
     date_str = request.query.get("date") or config.kyiv_today().strftime("%d.%m.%Y")
     try:
+        datetime.strptime(date_str, "%d.%m.%Y")
         target_date = datetime.strptime(date_str, "%d.%m.%Y").date()
     except ValueError:
         target_date = config.kyiv_today()
         date_str = target_date.strftime("%d.%m.%Y")
 
+    view = request.query.get("view", "columns")
+    if view not in ("columns", "list"):
+        view = "columns"
+
     prev_date = (target_date - timedelta(days=1)).strftime("%d.%m.%Y")
     next_date = (target_date + timedelta(days=1)).strftime("%d.%m.%Y")
 
-    columns = build_driver_columns(target_date, date_str)
-
-    cols_html = ""
-    if not columns:
-        cols_html = '<div class="empty">Поставок на цю дату не знайдено.</div>'
+    if view == "list":
+        body_html = render_list_view(date_str)
+        script = ""
     else:
-        lo, hi = compute_time_range(columns)
-        overall_max_top = assign_card_positions(columns, lo)
-        total_height = HEADER_OFFSET + max(overall_max_top + 160, (hi - lo) / 60 * PX_PER_HOUR + 40)
-
-        cols_html += build_ruler_html(lo, hi, total_height)
-
-        for col_idx, (phone, items) in enumerate(columns.items()):
-            color = DRIVER_COLORS[col_idx % len(DRIVER_COLORS)]
-            cards_html = ""
-
-            for idx, item in enumerate(items):
-                top = HEADER_OFFSET + item["top"]
-
-                if idx < len(items) - 1:
-                    next_top = HEADER_OFFSET + items[idx + 1]["top"]
-                    line_top = top + CARD_CENTER_OFFSET
-                    line_h = (next_top + CARD_CENTER_OFFSET) - line_top
-                    cards_html += (
-                        f'<div class="thread" style="top:{line_top}px; height:{line_h}px; '
-                        f'background:{color};"></div>'
-                    )
-
-                assigned = item["assigned"]
-                needed = item["needed"]
-                chips = ""
-                for w in assigned:
-                    if w.get("telegram_id"):
-                        url = f"tg://user?id={w['telegram_id']}"
-                        chips += f'<a class="worker-chip" href="{url}">{html_module.escape(w["name"])}</a>'
-                    elif w.get("username"):
-                        url = f"https://t.me/{w['username']}"
-                        chips += f'<a class="worker-chip" href="{url}">{html_module.escape(w["name"])}</a>'
-                    else:
-                        chips += f'<span class="worker-chip">{html_module.escape(w["name"])}</span>'
-
-                badge = ""
-                if needed:
-                    count = len(assigned)
-                    cls = "ok" if count >= needed else "need"
-                    badge = f'<span class="badge {cls}">{count}/{needed}</span>'
-
-                src_emoji = config.SOURCE_EMOJI.get(item["source"], "")
-                cards_html += (
-                    f'<div class="card" style="top:{top}px; border-left-color:{color};">'
-                    f'{telegram_md_to_html(item["text"])}'
-                    f'<div>{badge}{chips}</div>'
-                    f'<div class="src">{src_emoji} {config.SOURCE_LABEL.get(item["source"], "")}</div></div>'
-                )
-
-            cols_html += (
-                f'<div class="col" style="height:{total_height}px;">'
-                f'<div class="col-head">📞 {html_module.escape(phone)}</div>{cards_html}</div>'
-            )
+        body_html = render_columns_view(date_str)
+        script = f"<script>{ZOOM_SCRIPT}</script>"
 
     page = f"""<!DOCTYPE html>
 <html lang="uk"><head><meta charset="UTF-8">
@@ -263,114 +348,18 @@ async def dashboard_handler(request):
 <div class="header">
   <div class="header-title">Маршрути водіїв</div>
   <div class="nav">
-    <a href="/?date={prev_date}">← {prev_date}</a>
+    <a href="/?date={prev_date}&view={view}">← {prev_date}</a>
     <span>{date_str}</span>
-    <a href="/?date={next_date}">{next_date} →</a>
+    <a href="/?date={next_date}&view={view}">{next_date} →</a>
   </div>
 </div>
-<div class="board" id="board">
-  <div class="board-spacer" id="boardSpacer">
-    <div class="board-inner" id="boardInner">{cols_html}</div>
-  </div>
+<div class="view-switch">
+  <a href="/?date={date_str}&view=columns" class="{'active' if view == 'columns' else ''}">🚚 По водіям</a>
+  <a href="/?date={date_str}&view=list" class="{'active' if view == 'list' else ''}">🕐 Хронологічно</a>
 </div>
-<div class="zoom-controls">
-  <button id="zoomIn" aria-label="Наблизити">+</button>
-  <button id="zoomOut" aria-label="Віддалити">−</button>
-  <button id="zoomFit" aria-label="Показати все">⤢</button>
+{body_html}
 </div>
-</div>
-<script>
-(function() {{
-  var board = document.getElementById('board');
-  var spacer = document.getElementById('boardSpacer');
-  var inner = document.getElementById('boardInner');
-
-  var zoom = 1, minZoom = 0.3, maxZoom = 2.5;
-  var naturalW = 0, naturalH = 0;
-
-  function measure() {{
-    inner.style.transform = 'scale(1)';
-    naturalW = inner.scrollWidth;
-    naturalH = inner.scrollHeight;
-  }}
-
-  function applyZoom(z, focalX, focalY) {{
-    z = Math.min(maxZoom, Math.max(minZoom, z));
-    var ratio = z / zoom;
-    var beforeX = (focalX !== undefined) ? board.scrollLeft + focalX : 0;
-    var beforeY = (focalY !== undefined) ? board.scrollTop + focalY : 0;
-    zoom = z;
-    spacer.style.width = (naturalW * zoom) + 'px';
-    spacer.style.height = (naturalH * zoom) + 'px';
-    inner.style.transform = 'scale(' + zoom + ')';
-    if (focalX !== undefined) {{
-      board.scrollLeft = beforeX * ratio - focalX;
-      board.scrollTop = beforeY * ratio - focalY;
-    }}
-  }}
-
-  function fitAll() {{
-    var fitZoom = Math.min(board.clientWidth / naturalW, board.clientHeight / naturalH);
-    minZoom = Math.min(fitZoom, 1);
-    applyZoom(fitZoom);
-    board.scrollLeft = 0;
-    board.scrollTop = 0;
-  }}
-
-  function dist(t1, t2) {{
-    return Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
-  }}
-
-  window.addEventListener('load', function() {{
-    measure();
-    var fitZoom = Math.min(board.clientWidth / naturalW, board.clientHeight / naturalH);
-    minZoom = Math.min(fitZoom, 1);
-    applyZoom(1);
-  }});
-
-  var pinchStartDist = null, pinchStartZoom = 1;
-
-  board.addEventListener('touchstart', function(e) {{
-    if (e.touches.length === 2) {{
-      e.preventDefault();
-      pinchStartDist = dist(e.touches[0], e.touches[1]);
-      pinchStartZoom = zoom;
-    }}
-  }}, {{passive:false}});
-
-  board.addEventListener('touchmove', function(e) {{
-    if (e.touches.length === 2 && pinchStartDist) {{
-      e.preventDefault();
-      var d = dist(e.touches[0], e.touches[1]);
-      var factor = d / pinchStartDist;
-      var rect = board.getBoundingClientRect();
-      var midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
-      var midY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
-      applyZoom(pinchStartZoom * factor, midX, midY);
-    }}
-  }}, {{passive:false}});
-
-  board.addEventListener('touchend', function(e) {{
-    if (e.touches.length < 2) pinchStartDist = null;
-  }});
-
-  board.addEventListener('wheel', function(e) {{
-    if (e.ctrlKey) {{
-      e.preventDefault();
-      var rect = board.getBoundingClientRect();
-      applyZoom(zoom * (e.deltaY < 0 ? 1.1 : 0.9), e.clientX - rect.left, e.clientY - rect.top);
-    }}
-  }}, {{passive:false}});
-
-  document.getElementById('zoomIn').onclick = function() {{
-    applyZoom(zoom * 1.3, board.clientWidth / 2, board.clientHeight / 2);
-  }};
-  document.getElementById('zoomOut').onclick = function() {{
-    applyZoom(zoom / 1.3, board.clientWidth / 2, board.clientHeight / 2);
-  }};
-  document.getElementById('zoomFit').onclick = fitAll;
-}})();
-</script>
+{script}
 </body></html>"""
 
     return web.Response(text=page, content_type="text/html")
