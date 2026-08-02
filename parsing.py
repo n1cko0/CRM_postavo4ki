@@ -1,5 +1,6 @@
 import difflib
 import hashlib
+import json
 import re
 from datetime import datetime, date
 
@@ -335,14 +336,16 @@ def parse_ekol_deliveries(all_values: list, filter_date: date = None) -> list:
 
 # ==================== ПОСТАВКИ (свої записи в базі, синхронізація з Sheets) ====================
 def extract_fm_points(all_values: list, merged_cells: list) -> list:
-    """Кожен рядок таблиці FM — окрема точка (без об'єднання в маршрути,
-    об'єднання для показу відбувається окремо, при формуванні карток)."""
+    """Групує рядки FM ТОЧНІСІНЬКО так само, як раніше (один ТЦ з кількома брендами —
+    одна заявка з сумою коробок; маршрут з кількох різних ТЦ — теж одна заявка,
+    з розбивкою по точках у points_json). Просто тепер кожна така заявка —
+    ОДИН запис у базі, а не текст повідомлення."""
     cities = db.load_cities()
     excluded = {c.lower() for c in FM_EXCLUDED_CITIES}
     my_cities = {c.lower() for c in cities.keys()} - excluded
 
     routes = parse_routes(all_values, merged_cells)
-    points = []
+    records = []
 
     for route in routes:
         driver_phone = ""
@@ -352,6 +355,8 @@ def extract_fm_points(all_values: list, merged_cells: list) -> list:
                 if phone and not driver_phone:
                     driver_phone = phone
 
+        groups = []
+        current_group = []
         for row_idx, row in route:
             city = row[0].strip() if len(row) > 0 else ""
             tc = row[1].strip() if len(row) > 1 else ""
@@ -361,24 +366,88 @@ def extract_fm_points(all_values: list, merged_cells: list) -> list:
             delivery_date = row[7].strip() if len(row) > 7 else ""
             delivery_time = row[8].strip() if len(row) > 8 else ""
 
-            if not city or not delivery_date or city.lower() not in my_cities:
+            if not city or not delivery_date:
                 continue
 
-            import_src = f"fm|{delivery_date}|{city}|{tc}|{brand}|{delivery_time}|{driver_phone}"
-            points.append({
-                "source": "fm",
-                "delivery_date": delivery_date,
-                "city": city,
-                "detail": tc,
-                "brand": brand,
-                "boxes": boxes,
-                "workers_needed": parse_int_safe(workers_cell),
-                "time": delivery_time,
-                "driver_phone": driver_phone,
-                "import_key": "fm:" + hashlib.sha256(import_src.encode("utf-8")).hexdigest()[:16],
-            })
+            is_continuation = is_merged_with_above(row_idx, 5, merged_cells)
+            point = {
+                "city": city, "tc": tc, "brand": brand, "boxes": boxes,
+                "workers": workers_cell, "date_str": delivery_date, "time": delivery_time,
+            }
+            if is_continuation:
+                current_group.append(point)
+            else:
+                if current_group:
+                    groups.append(current_group)
+                current_group = [point]
+        if current_group:
+            groups.append(current_group)
 
-    return points
+        for group in groups:
+            first = group[0]
+
+            if len(group) == 1:
+                if first["city"].lower() not in my_cities:
+                    continue
+                record = _make_fm_record(first["date_str"], first["city"], first["tc"],
+                                          first["brand"], first["boxes"], first["workers"],
+                                          first["time"], driver_phone, None)
+            else:
+                filtered = [p for p in group if p["city"].lower() in my_cities]
+                if not filtered:
+                    continue
+                first = filtered[0]
+                unique_tc = {p["tc"] for p in filtered}
+
+                if len(unique_tc) == 1:
+                    brands = ", ".join(p["brand"] for p in filtered)
+                    total_boxes = sum(int(p["boxes"]) for p in filtered if p["boxes"].isdigit())
+                    record = _make_fm_record(first["date_str"], first["city"], first["tc"],
+                                              brands, str(total_boxes), first["workers"],
+                                              first["time"], driver_phone, None)
+                elif len(filtered) == 1:
+                    record = _make_fm_record(first["date_str"], first["city"], first["tc"],
+                                              first["brand"], first["boxes"], first["workers"],
+                                              first["time"], driver_phone, None)
+                else:
+                    sub_points = [
+                        {"city": p["city"], "detail": p["tc"], "brand": p["brand"],
+                         "boxes": p["boxes"], "time": p["time"]}
+                        for p in filtered
+                    ]
+                    record = _make_fm_record(
+                        first["date_str"], "🗺 Маршрут", f"{len(filtered)} точки", "", "",
+                        first["workers"], first["time"], driver_phone, sub_points
+                    )
+
+            records.append(record)
+
+    return records
+
+
+def _make_fm_record(date_str, city, detail, brand, boxes, workers, time_str, driver_phone, sub_points):
+    """Допоміжна — формує один запис поставки FM + стабільний import_key для дедуплікації."""
+    if sub_points:
+        points_json = json.dumps(sub_points, ensure_ascii=False)
+        key_src = "fm|route|" + "|".join(f"{p['city']}:{p['detail']}:{p['time']}" for p in sub_points) + f"|{driver_phone}"
+    else:
+        points_json = None
+        key_src = f"fm|{date_str}|{city}|{detail}|{brand}|{time_str}|{driver_phone}"
+
+    return {
+        "source": "fm",
+        "delivery_date": date_str,
+        "city": city,
+        "detail": detail,
+        "brand": brand,
+        "boxes": boxes,
+        "workers_needed": parse_int_safe(workers),
+        "time": time_str,
+        "driver_phone": driver_phone,
+        "points_json": points_json,
+        "import_key": "fm:" + hashlib.sha256(key_src.encode("utf-8")).hexdigest()[:16],
+    }
+
 
 
 def extract_ekol_points(all_values: list) -> list:
@@ -464,6 +533,27 @@ def format_delivery_card(d: dict) -> str:
     """Формує текст картки поставки з запису в базі (замість того, щоб форматувати
     напряму з Google Sheets, як раніше)."""
     src_emoji = "🔴" if d["source"] == "fm" else "🔵"
+    src_label = "FM" if d["source"] == "fm" else "Ekol"
+
+    if d.get("points_json"):
+        sub_points = json.loads(d["points_json"])
+        lines = ["🗺 *Маршрут*"]
+        if d.get("workers_needed"):
+            lines.append(f"👷 Вантажників: {d['workers_needed']}")
+        if d.get("hours"):
+            lines.append(f"⏱ Годин оплати: {format_hours(d['hours'])}")
+        if d.get("driver_phone"):
+            lines.append(f"📞 {d['driver_phone']}")
+        lines.append("─────────────────")
+        for p in sub_points:
+            point_line = f"📦 *{p['brand']}*\n📍 {p['city']}, {p['detail']}\n📅 {d['delivery_date']}"
+            if p.get("time"):
+                point_line += f"  🕐 {p['time']}"
+            point_line += f"  📦 {p['boxes']} кор."
+            lines.append(point_line)
+        lines.append(f"{src_emoji} {src_label}")
+        return "\n".join(lines)
+
     lines = [f"📦 *{d.get('brand') or '—'}*"]
     location = d["city"]
     if d.get("detail"):
@@ -483,7 +573,7 @@ def format_delivery_card(d: dict) -> str:
         lines.append(f"⏱ Годин оплати: {format_hours(d['hours'])}")
     if d.get("driver_phone"):
         lines.append(f"📞 {d['driver_phone']}")
-    lines.append(f"{src_emoji} {'FM' if d['source'] == 'fm' else 'Ekol'}")
+    lines.append(f"{src_emoji} {src_label}")
 
     return "\n".join(lines)
 

@@ -88,6 +88,7 @@ def init_db():
             hours REAL,
             time TEXT,
             driver_phone TEXT,
+            points_json TEXT,
             import_key TEXT UNIQUE,
             is_deleted INTEGER NOT NULL DEFAULT 0,
             created_at TEXT,
@@ -95,6 +96,9 @@ def init_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_date ON deliveries(delivery_date)")
+    deliveries_cols = [r["name"] for r in conn.execute("PRAGMA table_info(deliveries)")]
+    if "points_json" not in deliveries_cols:
+        conn.execute("ALTER TABLE deliveries ADD COLUMN points_json TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_contacts (
             telegram_id INTEGER PRIMARY KEY,
@@ -546,12 +550,13 @@ def db_upsert_delivery(record: dict):
     cur = conn.execute(
         """INSERT INTO deliveries
            (source, delivery_date, city, detail, brand, boxes, workers_needed, time,
-            driver_phone, import_key, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            driver_phone, points_json, import_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             record["source"], record["delivery_date"], record["city"], record.get("detail", ""),
             record.get("brand", ""), record.get("boxes", ""), record.get("workers_needed"),
-            record.get("time", ""), record.get("driver_phone", ""), record["import_key"], now, now,
+            record.get("time", ""), record.get("driver_phone", ""), record.get("points_json"),
+            record["import_key"], now, now,
         )
     )
     conn.commit()
