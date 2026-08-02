@@ -585,7 +585,11 @@ def db_get_deliveries(delivery_date: str = None, source: str = None, include_del
     deliveries = [dict(r) for r in rows]
 
     def time_key(d):
-        return d.get("time") or "99:99"  # без часу — в кінець
+        t = (d.get("time") or "").strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})", t)
+        if not m:
+            return 9999  # без часу — в кінець
+        return int(m.group(1)) * 60 + int(m.group(2))
 
     groups = {}
     for d in deliveries:
