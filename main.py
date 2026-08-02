@@ -9,6 +9,7 @@ import db
 import state
 import handlers
 import dashboard
+import backup
 
 # Підвантажуємо збережені вибори дат звітів (переживають рестарт бота) —
 # робимо це тут, а не в db.py, щоб уникнути циклічного імпорту (state -> db -> state)
@@ -23,6 +24,7 @@ async def main():
     app.add_handler(CommandHandler("removecity", handlers.removecity))
     app.add_handler(CommandHandler("addalias", handlers.addalias))
     app.add_handler(CommandHandler("removealias", handlers.removealias))
+    app.add_handler(CommandHandler("backupnow", backup.backup_now_command))
 
     # group=0: сначала пробуем перехватить сообщение в группе как "оплату"
     # (UpdateType.MESSAGE — явно тільки НОВІ повідомлення, інакше цей хендлер
@@ -55,6 +57,8 @@ async def main():
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     config.logger.info("Бот запущено!")
+
+    asyncio.create_task(backup.daily_backup_loop(app.bot))
 
     try:
         await asyncio.Event().wait()  # тримаємо процес живим, поки Railway не зупинить його
