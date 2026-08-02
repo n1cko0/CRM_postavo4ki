@@ -1,4 +1,5 @@
 import difflib
+import hashlib
 import re
 from datetime import datetime, date
 
@@ -328,6 +329,161 @@ def parse_ekol_deliveries(all_values: list, filter_date: date = None) -> list:
         })
 
     return messages
+
+
+# ==================== ПОСТАВКИ (свої записи в базі, синхронізація з Sheets) ====================
+def extract_fm_points(all_values: list, merged_cells: list) -> list:
+    """Кожен рядок таблиці FM — окрема точка (без об'єднання в маршрути,
+    об'єднання для показу відбувається окремо, при формуванні карток)."""
+    cities = db.load_cities()
+    excluded = {c.lower() for c in FM_EXCLUDED_CITIES}
+    my_cities = {c.lower() for c in cities.keys()} - excluded
+
+    routes = parse_routes(all_values, merged_cells)
+    points = []
+
+    for route in routes:
+        driver_phone = ""
+        for row_idx, row in route:
+            if len(row) > 9 and row[9].strip():
+                phone = extract_phone(row[9])
+                if phone and not driver_phone:
+                    driver_phone = phone
+
+        for row_idx, row in route:
+            city = row[0].strip() if len(row) > 0 else ""
+            tc = row[1].strip() if len(row) > 1 else ""
+            brand = row[2].strip() if len(row) > 2 else ""
+            boxes = row[4].strip() if len(row) > 4 else ""
+            workers_cell = row[5].strip() if len(row) > 5 else ""
+            delivery_date = row[7].strip() if len(row) > 7 else ""
+            delivery_time = row[8].strip() if len(row) > 8 else ""
+
+            if not city or not delivery_date or city.lower() not in my_cities:
+                continue
+
+            import_src = f"fm|{delivery_date}|{city}|{tc}|{brand}|{delivery_time}|{driver_phone}"
+            points.append({
+                "source": "fm",
+                "delivery_date": delivery_date,
+                "city": city,
+                "detail": tc,
+                "brand": brand,
+                "boxes": boxes,
+                "workers_needed": parse_int_safe(workers_cell),
+                "time": delivery_time,
+                "driver_phone": driver_phone,
+                "import_key": "fm:" + hashlib.sha256(import_src.encode("utf-8")).hexdigest()[:16],
+            })
+
+    return points
+
+
+def extract_ekol_points(all_values: list) -> list:
+    """Кожен рядок таблиці Ekol — окрема, незалежна точка поставки."""
+    cities = db.load_cities()
+    points = []
+
+    for row in all_values:
+        company = row[0].strip() if len(row) > 0 else ""
+        address = row[1].strip() if len(row) > 1 else ""
+        date_str = row[2].strip() if len(row) > 2 else ""
+        time_str = row[3].strip() if len(row) > 3 else ""
+        qty = row[4].strip() if len(row) > 4 else ""
+        workers = row[5].strip() if len(row) > 5 else ""
+        phone = row[6].strip() if len(row) > 6 else ""
+
+        if not address or not date_str:
+            continue
+
+        parsed_ok = False
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+            try:
+                datetime.strptime(date_str, fmt)
+                parsed_ok = True
+                break
+            except ValueError:
+                continue
+        if not parsed_ok or not address_matches_my_cities(address, cities):
+            continue
+
+        import_src = f"ekol|{date_str}|{address}|{company}|{time_str}|{phone}"
+        points.append({
+            "source": "ekol",
+            "delivery_date": date_str,
+            "city": address,
+            "detail": "",
+            "brand": company,
+            "boxes": qty,
+            "workers_needed": parse_int_safe(workers),
+            "time": time_str,
+            "driver_phone": phone,
+            "import_key": "ekol:" + hashlib.sha256(import_src.encode("utf-8")).hexdigest()[:16],
+        })
+
+    return points
+
+
+def sync_deliveries_from_sheets() -> dict:
+    """Тягне свіжі дані з обох таблиць (FM + Ekol) і додає в нашу базу тільки НОВІ
+    поставки (за import_key). Вже існуючі записи не чіпає — ручні правки (години,
+    кількість коробок) не затираються повторною синхронізацією."""
+    result = {"fm_new": 0, "fm_total": 0, "ekol_new": 0, "ekol_total": 0, "errors": []}
+
+    try:
+        all_values, merged_cells = get_sheet_data(source="fm")
+        points = extract_fm_points(all_values, merged_cells)
+        result["fm_total"] = len(points)
+        for p in points:
+            _, created = db.db_upsert_delivery(p)
+            if created:
+                result["fm_new"] += 1
+    except Exception as e:
+        logger.error(f"Синхронізація FM: {e}", exc_info=True)
+        result["errors"].append(f"FM: {e}")
+
+    from config import EKOL_SPREADSHEET_ID
+    if EKOL_SPREADSHEET_ID:
+        try:
+            all_values_ekol, _ = get_sheet_data(source="ekol")
+            points = extract_ekol_points(all_values_ekol)
+            result["ekol_total"] = len(points)
+            for p in points:
+                _, created = db.db_upsert_delivery(p)
+                if created:
+                    result["ekol_new"] += 1
+        except Exception as e:
+            logger.error(f"Синхронізація Ekol: {e}", exc_info=True)
+            result["errors"].append(f"Ekol: {e}")
+
+    return result
+
+
+def format_delivery_card(d: dict) -> str:
+    """Формує текст картки поставки з запису в базі (замість того, щоб форматувати
+    напряму з Google Sheets, як раніше)."""
+    src_emoji = "🔴" if d["source"] == "fm" else "🔵"
+    lines = [f"📦 *{d.get('brand') or '—'}*"]
+    location = d["city"]
+    if d.get("detail"):
+        location += f", {d['detail']}"
+    lines.append(f"📍 {location}")
+
+    date_line = f"📅 {d['delivery_date']}"
+    if d.get("time"):
+        date_line += f"  🕐 {d['time']}"
+    lines.append(date_line)
+
+    if d.get("boxes"):
+        lines.append(f"📦 Коробок: {d['boxes']}")
+    if d.get("workers_needed"):
+        lines.append(f"👷 Вантажників: {d['workers_needed']}")
+    if d.get("hours"):
+        lines.append(f"⏱ Годин оплати: {format_hours(d['hours'])}")
+    if d.get("driver_phone"):
+        lines.append(f"📞 {d['driver_phone']}")
+
+    return "\n".join(lines)
 
 
 # ==================== ЗВІТ ТА СТАТИСТИКА ====================

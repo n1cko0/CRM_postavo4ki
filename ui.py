@@ -4,9 +4,10 @@ import db
 import parsing
 
 
-def get_delivery_assign_keyboard(delivery_key: str) -> InlineKeyboardMarkup:
-    assigned = db.db_get_assigned_workers(delivery_key)
-    needed = db.get_needed_from_key(delivery_key)
+def get_delivery_assign_keyboard(delivery_id: int) -> InlineKeyboardMarkup:
+    assigned = db.db_get_assigned_workers(delivery_id)
+    delivery = db.db_get_delivery(delivery_id)
+    needed = delivery.get("workers_needed") if delivery else None
     keyboard = []
 
     for w in assigned:
@@ -16,18 +17,18 @@ def get_delivery_assign_keyboard(delivery_key: str) -> InlineKeyboardMarkup:
             row.append(InlineKeyboardButton(w["name"], url=chat_url))
         else:
             row.append(InlineKeyboardButton(w["name"], callback_data="noop"))
-        row.append(InlineKeyboardButton("❌", callback_data=f"unassign_{delivery_key}_{w['id']}"))
+        row.append(InlineKeyboardButton("❌", callback_data=f"unassign_{delivery_id}_{w['id']}"))
         keyboard.append(row)
 
     count = len(assigned)
     if needed and count >= needed:
         keyboard.append([
             InlineKeyboardButton(f"✅ Набрано ({count}/{needed})", callback_data="noop"),
-            InlineKeyboardButton("➕ Призначити", callback_data=f"assign_{delivery_key}"),
+            InlineKeyboardButton("➕ Призначити", callback_data=f"assign_{delivery_id}"),
         ])
     else:
         label = f"➕ Призначити ({count}/{needed})" if needed else "➕ Призначити"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"assign_{delivery_key}")])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"assign_{delivery_id}")])
 
     return InlineKeyboardMarkup(keyboard)
 

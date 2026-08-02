@@ -34,41 +34,22 @@ def telegram_md_to_html(text: str) -> str:
 
 
 def build_driver_columns(target_date: date, date_str: str) -> dict:
-    """Групує поставки FM+Ekol на дату по водію (за телефоном) і підвантажує
+    """Групує поставки на дату по водію (за телефоном) і підвантажує
     реальні призначення робітників з бази — те, що бачить бот."""
-    all_messages = []
-
-    try:
-        all_values, merged_cells = parsing.get_sheet_data(source="fm")
-        routes = parsing.parse_routes(all_values, merged_cells)
-        fm_msgs = parsing.build_delivery_messages(routes, merged_cells, filter_date=target_date)
-        for m in fm_msgs:
-            m["source"] = "fm"
-        all_messages += fm_msgs
-    except Exception as e:
-        config.logger.error(f"Дашборд: помилка завантаження FM: {e}", exc_info=True)
-
-    if config.EKOL_SPREADSHEET_ID:
-        try:
-            all_values_ekol, _ = parsing.get_sheet_data(source="ekol")
-            ekol_msgs = parsing.parse_ekol_deliveries(all_values_ekol, filter_date=target_date)
-            for m in ekol_msgs:
-                m["source"] = "ekol"
-            all_messages += ekol_msgs
-        except Exception as e:
-            config.logger.error(f"Дашборд: помилка завантаження Ekol: {e}", exc_info=True)
+    deliveries = db.db_get_deliveries(delivery_date=date_str)
 
     columns = {}
-    for m in all_messages:
-        phone = extract_phone_from_card(m["text"]) or "Без номера водія"
-        delivery_key = db.make_delivery_key(m["source"], m["date_str"], m["text"], needed=m.get("workers_needed"))
-        assigned = db.db_get_assigned_workers(delivery_key)
+    for d in deliveries:
+        text = parsing.format_delivery_card(d)
+        phone = d.get("driver_phone") or "Без номера водія"
+        assigned = db.db_get_assigned_workers(d["id"])
         columns.setdefault(phone, []).append({
-            "text": m["text"],
-            "source": m["source"],
+            "delivery_id": d["id"],
+            "text": text,
+            "source": d["source"],
             "assigned": assigned,
-            "needed": m.get("workers_needed"),
-            "sort_key": extract_time_minutes(m["text"]),
+            "needed": d.get("workers_needed"),
+            "sort_key": extract_time_minutes(text),
         })
 
     for phone in columns:
@@ -452,7 +433,7 @@ async def login_handler(request):
 @web.middleware
 async def auth_middleware(request, handler):
     if not config.DASHBOARD_PASSWORD:
-        return web.Response(text="Дашборд не налаштовано: відсутня змінна config.py.DASHBOARD_PASSWORD.", status=503)
+        return web.Response(text="Дашборд не налаштовано: відсутня змінна config.DASHBOARD_PASSWORD.", status=503)
 
     if request.path == "/login":
         return await handler(request)

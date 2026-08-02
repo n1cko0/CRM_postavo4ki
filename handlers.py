@@ -147,38 +147,32 @@ async def send_deliveries_query(query, context: ContextTypes.DEFAULT_TYPE, sourc
     bot = context.bot
     emoji = config.SOURCE_EMOJI.get(source, "")
     label = config.SOURCE_LABEL.get(source, source)
-    await query.edit_message_text(f"⏳ {emoji} Завантажую дані з таблиці {label}...")
+    await query.edit_message_text(f"⏳ {emoji} Завантажую поставки {label} з бази...")
     try:
-        all_values, merged_cells = parsing.get_sheet_data(source=source)
+        date_str = filter_date.strftime("%d.%m.%Y") if filter_date else None
+        deliveries = db.db_get_deliveries(delivery_date=date_str, source=source)
 
-        if source == "ekol":
-            messages = parsing.parse_ekol_deliveries(all_values, filter_date=filter_date)
-        else:
-            routes = parsing.parse_routes(all_values, merged_cells)
-            messages = parsing.build_delivery_messages(routes, merged_cells, filter_date=filter_date)
-
-        if not messages:
-            date_info = filter_date.strftime("%d.%m.%Y") if filter_date else ""
+        if not deliveries:
+            date_info = date_str or ""
             await send_with_retry(
                 bot, chat_id,
-                f"❌ {emoji} Поставок {label} {'на ' + date_info if date_info else ''} не знайдено."
+                f"❌ {emoji} Поставок {label} {'на ' + date_info if date_info else ''} не знайдено в базі.\n\n"
+                f"Спробуй спочатку «🔄 Синхронізувати з таблиць»."
             )
             return
 
-        date_info = filter_date.strftime("%d.%m.%Y") if filter_date else "всі"
+        date_info = date_str or "всі"
         await send_with_retry(
             bot, chat_id,
-            f"✅ {emoji} {label}: знайдено поставок *{len(messages)}* (дата: {date_info})",
+            f"✅ {emoji} {label}: знайдено поставок *{len(deliveries)}* (дата: {date_info})",
             parse_mode="Markdown"
         )
 
-        for msg_data in messages:
-            delivery_key = db.make_delivery_key(
-                source, msg_data["date_str"], msg_data["text"], needed=msg_data.get("workers_needed")
-            )
+        for d in deliveries:
+            text = parsing.format_delivery_card(d)
             await send_with_retry(
-                bot, chat_id, msg_data["text"], parse_mode="Markdown",
-                reply_markup=ui.get_delivery_assign_keyboard(delivery_key)
+                bot, chat_id, text, parse_mode="Markdown",
+                reply_markup=ui.get_delivery_assign_keyboard(d["id"])
             )
             await asyncio.sleep(0.35)
 
@@ -520,11 +514,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📦 Поставки":
         keyboard = [
+            [InlineKeyboardButton("🔄 Синхронізувати з таблиць", callback_data="dlvsync")],
             [InlineKeyboardButton("🔴 FM", callback_data="dlvsrc_fm")],
             [InlineKeyboardButton("🔵 Ekol", callback_data="dlvsrc_ekol")],
         ]
         await update.message.reply_text(
-            "Оберіть таблицю:",
+            "Оберіть таблицю (або спочатку синхронізуй, якщо давно не робив цього):",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     elif text == "🏙 Мої міста":
@@ -569,7 +564,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data.startswith("dlvsrc_"):
+    if data == "dlvsync":
+        await query.edit_message_text("⏳ Синхронізую поставки з таблиць...")
+        result = parsing.sync_deliveries_from_sheets()
+        text = (
+            f"✅ Синхронізацію завершено.\n\n"
+            f"🔴 FM: {result['fm_new']} нових з {result['fm_total']} у таблиці\n"
+            f"🔵 Ekol: {result['ekol_new']} нових з {result['ekol_total']} у таблиці"
+        )
+        if result["errors"]:
+            text += "\n\n⚠️ Помилки:\n" + "\n".join(result["errors"])
+        keyboard = [
+            [InlineKeyboardButton("🔴 FM", callback_data="dlvsrc_fm")],
+            [InlineKeyboardButton("🔵 Ekol", callback_data="dlvsrc_ekol")],
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("dlvsrc_"):
         source = data.replace("dlvsrc_", "")
         label = config.SOURCE_LABEL.get(source, source)
         emoji = config.SOURCE_EMOJI.get(source, "")
@@ -1051,32 +1062,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("assignpick_"):
         rest = data.replace("assignpick_", "")
-        delivery_key, worker_id_str = rest.rsplit("_", 1)
-        db.db_assign_worker(delivery_key, int(worker_id_str))
-        await query.edit_message_reply_markup(reply_markup=ui.get_delivery_assign_keyboard(delivery_key))
+        delivery_id_str, worker_id_str = rest.split("_")
+        delivery_id = int(delivery_id_str)
+        db.db_assign_worker(delivery_id, int(worker_id_str))
+        await query.edit_message_reply_markup(reply_markup=ui.get_delivery_assign_keyboard(delivery_id))
 
     elif data.startswith("assignback_"):
-        delivery_key = data.replace("assignback_", "")
-        await query.edit_message_reply_markup(reply_markup=ui.get_delivery_assign_keyboard(delivery_key))
+        delivery_id = int(data.replace("assignback_", ""))
+        await query.edit_message_reply_markup(reply_markup=ui.get_delivery_assign_keyboard(delivery_id))
 
     elif data.startswith("assign_"):
-        delivery_key = data.replace("assign_", "")
+        delivery_id = int(data.replace("assign_", ""))
         workers = db.db_get_workers()
         if not workers:
             await query.answer("Реєстр робітників порожній — спочатку додай когось у 👷 Робітники.", show_alert=True)
             return
         keyboard = [
-            [InlineKeyboardButton(w["name"] or f"#{w['id']}", callback_data=f"assignpick_{delivery_key}_{w['id']}")]
+            [InlineKeyboardButton(w["name"] or f"#{w['id']}", callback_data=f"assignpick_{delivery_id}_{w['id']}")]
             for w in workers
         ]
-        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"assignback_{delivery_key}")])
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=f"assignback_{delivery_id}")])
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("unassign_"):
         rest = data.replace("unassign_", "")
-        delivery_key, worker_id_str = rest.rsplit("_", 1)
-        db.db_unassign_worker(delivery_key, int(worker_id_str))
-        await query.edit_message_reply_markup(reply_markup=ui.get_delivery_assign_keyboard(delivery_key))
+        delivery_id_str, worker_id_str = rest.split("_")
+        delivery_id = int(delivery_id_str)
+        db.db_unassign_worker(delivery_id, int(worker_id_str))
+        await query.edit_message_reply_markup(reply_markup=ui.get_delivery_assign_keyboard(delivery_id))
 
     elif data == "noop":
         pass  # інформаційна кнопка (наприклад "✅ Набрано" або ім'я без контакту) — нічого не робимо

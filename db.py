@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import re
@@ -65,12 +64,37 @@ def init_db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS delivery_assignments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            delivery_key TEXT NOT NULL,
+            delivery_key TEXT,
+            delivery_id INTEGER,
             worker_id INTEGER NOT NULL,
             created_at TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_assignments_key ON delivery_assignments(delivery_key)")
+    da_cols = [r["name"] for r in conn.execute("PRAGMA table_info(delivery_assignments)")]
+    if "delivery_id" not in da_cols:
+        conn.execute("ALTER TABLE delivery_assignments ADD COLUMN delivery_id INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_assignments_delivery_id ON delivery_assignments(delivery_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            delivery_date TEXT NOT NULL,
+            city TEXT NOT NULL,
+            detail TEXT,
+            brand TEXT,
+            boxes TEXT,
+            workers_needed INTEGER,
+            hours REAL,
+            time TEXT,
+            driver_phone TEXT,
+            import_key TEXT UNIQUE,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_date ON deliveries(delivery_date)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_contacts (
             telegram_id INTEGER PRIMARY KEY,
@@ -465,69 +489,39 @@ def db_promote_worker_phone(worker_id: int, phone_id: int):
 
 
 # ==================== ПРИЗНАЧЕННЯ РОБІТНИКІВ НА ПОСТАВКИ ====================
-def make_delivery_key(source: str, date_str: str, text: str, needed: int = None) -> str:
-    """Стабільний ключ поставки: не залежить від сесії/id повідомлення,
-    тільки від змісту картки — щоб призначення переживали рестарт бота.
-    Кількість потрібних людей закодована прямо в ключі (щоб клавіатуру
-    можна було перебудувати з самого ключа, без додаткового стану)."""
-    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    needed_part = str(needed) if needed else "x"
-    return f"{source}:{date_str}:{h}:{needed_part}"
-
-
-def get_needed_from_key(delivery_key: str):
-    parts = delivery_key.split(":")
-    if len(parts) >= 4 and parts[3].isdigit():
-        return int(parts[3])
-    return None
-
-
-def db_assign_worker(delivery_key: str, worker_id: int):
+def db_assign_worker(delivery_id: int, worker_id: int):
     conn = get_conn()
     existing = conn.execute(
-        "SELECT id FROM delivery_assignments WHERE delivery_key = ? AND worker_id = ?",
-        (delivery_key, worker_id)
+        "SELECT id FROM delivery_assignments WHERE delivery_id = ? AND worker_id = ?",
+        (delivery_id, worker_id)
     ).fetchone()
     if not existing:
         conn.execute(
-            "INSERT INTO delivery_assignments (delivery_key, worker_id, created_at) VALUES (?, ?, ?)",
-            (delivery_key, worker_id, datetime.now().isoformat())
+            "INSERT INTO delivery_assignments (delivery_id, worker_id, created_at) VALUES (?, ?, ?)",
+            (delivery_id, worker_id, datetime.now().isoformat())
         )
         conn.commit()
     conn.close()
 
 
-def db_unassign_worker(delivery_key: str, worker_id: int):
+def db_unassign_worker(delivery_id: int, worker_id: int):
     conn = get_conn()
     conn.execute(
-        "DELETE FROM delivery_assignments WHERE delivery_key = ? AND worker_id = ?",
-        (delivery_key, worker_id)
+        "DELETE FROM delivery_assignments WHERE delivery_id = ? AND worker_id = ?",
+        (delivery_id, worker_id)
     )
     conn.commit()
     conn.close()
 
 
-def db_get_assigned_workers(delivery_key: str) -> list:
+def db_get_assigned_workers(delivery_id: int) -> list:
     conn = get_conn()
-
-    # міграція зі старого формату ключа (без закодованої кількості потрібних людей):
-    # якщо є записи під "коротким" ключем цієї ж поставки — переносимо їх на новий ключ
-    parts = delivery_key.split(":")
-    if len(parts) >= 4:
-        legacy_key = ":".join(parts[:3])
-        if legacy_key != delivery_key:
-            conn.execute(
-                "UPDATE delivery_assignments SET delivery_key = ? WHERE delivery_key = ?",
-                (delivery_key, legacy_key)
-            )
-            conn.commit()
-
     rows = conn.execute("""
         SELECT w.id, w.name, w.username, w.telegram_id FROM delivery_assignments da
         JOIN workers w ON w.id = da.worker_id
-        WHERE da.delivery_key = ?
+        WHERE da.delivery_id = ?
         ORDER BY da.id
-    """, (delivery_key,)).fetchall()
+    """, (delivery_id,)).fetchall()
     conn.close()
     return [
         {"id": r["id"], "name": r["name"], "username": r["username"] or "", "telegram_id": r["telegram_id"]}
@@ -535,6 +529,111 @@ def db_get_assigned_workers(delivery_key: str) -> list:
     ]
 
 
+# ==================== ПОСТАВКИ (свої записи, більше не читаються "наживо" з Sheets) ====================
+def db_upsert_delivery(record: dict):
+    """Вставляє нову поставку, якщо такого import_key ще немає (за ним і визначається
+    'та сама поставка' між синхронізаціями). Якщо вже є — нічого не робить,
+    не зачіпає ручні правки (години, кількість коробок і т.д.)."""
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT id FROM deliveries WHERE import_key = ?", (record["import_key"],)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return existing["id"], False
+
+    now = datetime.now().isoformat()
+    cur = conn.execute(
+        """INSERT INTO deliveries
+           (source, delivery_date, city, detail, brand, boxes, workers_needed, time,
+            driver_phone, import_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            record["source"], record["delivery_date"], record["city"], record.get("detail", ""),
+            record.get("brand", ""), record.get("boxes", ""), record.get("workers_needed"),
+            record.get("time", ""), record.get("driver_phone", ""), record["import_key"], now, now,
+        )
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id, True
+
+
+def db_get_deliveries(delivery_date: str = None, source: str = None, include_deleted: bool = False) -> list:
+    conn = get_conn()
+    query = "SELECT * FROM deliveries WHERE 1=1"
+    params = []
+    if delivery_date:
+        query += " AND delivery_date = ?"
+        params.append(delivery_date)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    if not include_deleted:
+        query += " AND is_deleted = 0"
+    query += " ORDER BY time, id"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def db_get_delivery(delivery_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def db_update_delivery(delivery_id: int, field: str, value):
+    column = {
+        "city": "city", "detail": "detail", "brand": "brand", "boxes": "boxes",
+        "workers_needed": "workers_needed", "hours": "hours", "time": "time",
+        "driver_phone": "driver_phone", "delivery_date": "delivery_date",
+    }.get(field)
+    if not column:
+        raise ValueError(f"Невідоме поле поставки: {field}")
+    conn = get_conn()
+    conn.execute(
+        f"UPDATE deliveries SET {column} = ?, updated_at = ? WHERE id = ?",
+        (value, datetime.now().isoformat(), delivery_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_delivery(delivery_id: int):
+    """М'яке видалення — запис лишається в базі (з призначеннями), просто ховається зі списків."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE deliveries SET is_deleted = 1, updated_at = ? WHERE id = ?",
+        (datetime.now().isoformat(), delivery_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_restore_delivery(delivery_id: int):
+    conn = get_conn()
+    conn.execute(
+        "UPDATE deliveries SET is_deleted = 0, updated_at = ? WHERE id = ?",
+        (datetime.now().isoformat(), delivery_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_add_manual_delivery(source: str, delivery_date: str, city: str, **kwargs) -> int:
+    """Створює поставку вручну (не через синхронізацію) — свій унікальний import_key,
+    щоб не конфліктувати з тими, що прийдуть при наступній синхронізації."""
+    import uuid
+    record = {
+        "source": source, "delivery_date": delivery_date, "city": city,
+        "import_key": f"manual:{uuid.uuid4().hex}",
+        **kwargs,
+    }
+    delivery_id, _ = db_upsert_delivery(record)
+    return delivery_id
 
 
 def normalize_phone(phone: str) -> str:
