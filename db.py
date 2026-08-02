@@ -577,7 +577,7 @@ def db_get_deliveries(delivery_date: str = None, source: str = None, include_del
         params.append(source)
     if not include_deleted:
         query += " AND is_deleted = 0"
-    query += " ORDER BY time, id"
+    query += " ORDER BY driver_phone, time, id"
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
