@@ -566,6 +566,9 @@ def db_upsert_delivery(record: dict):
 
 
 def db_get_deliveries(delivery_date: str = None, source: str = None, include_deleted: bool = False) -> list:
+    """Поставки одного водія завжди йдуть єдиним блоком (спочатку його найраніша
+    поставка, потім решта по часу), а самі блоки водіїв впорядковані за часом
+    їхньої найпершої поставки — водій, що починає раніше, йде першим."""
     conn = get_conn()
     query = "SELECT * FROM deliveries WHERE 1=1"
     params = []
@@ -577,10 +580,25 @@ def db_get_deliveries(delivery_date: str = None, source: str = None, include_del
         params.append(source)
     if not include_deleted:
         query += " AND is_deleted = 0"
-    query += " ORDER BY driver_phone, time, id"
     rows = conn.execute(query, params).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    deliveries = [dict(r) for r in rows]
+
+    def time_key(d):
+        return d.get("time") or "99:99"  # без часу — в кінець
+
+    groups = {}
+    for d in deliveries:
+        groups.setdefault(d.get("driver_phone") or "", []).append(d)
+    for phone in groups:
+        groups[phone].sort(key=lambda d: (time_key(d), d["id"]))
+
+    ordered_phones = sorted(groups.keys(), key=lambda p: time_key(groups[p][0]))
+
+    result = []
+    for phone in ordered_phones:
+        result.extend(groups[phone])
+    return result
 
 
 def db_get_delivery(delivery_id: int):
