@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import hmac
 import html as html_module
@@ -182,11 +181,11 @@ body { background:#E9E9E7; font-family:'Inter',-apple-system,sans-serif; display
 
 
 async def dashboard_handler(request):
-    date_str = request.query.get("date") or kyiv_today().strftime("%d.%m.%Y")
+    date_str = request.query.get("date") or config.kyiv_today().strftime("%d.%m.%Y")
     try:
         target_date = datetime.strptime(date_str, "%d.%m.%Y").date()
     except ValueError:
-        target_date = kyiv_today()
+        target_date = config.kyiv_today()
         date_str = target_date.strftime("%d.%m.%Y")
 
     prev_date = (target_date - timedelta(days=1)).strftime("%d.%m.%Y")

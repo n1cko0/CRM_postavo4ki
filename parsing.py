@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 import db
+import config
 from config import CREDENTIALS_FILE, SCOPES, FM_EXCLUDED_CITIES, logger
 
 
@@ -14,11 +15,12 @@ from config import CREDENTIALS_FILE, SCOPES, FM_EXCLUDED_CITIES, logger
 def get_sheet_data(source: str = "fm"):
     import base64
     import json as json_module
+    import os
 
     if source == "fm":
-        spreadsheet_id = FM_SPREADSHEET_ID
+        spreadsheet_id = config.FM_SPREADSHEET_ID
     elif source == "ekol":
-        spreadsheet_id = EKOL_SPREADSHEET_ID
+        spreadsheet_id = config.EKOL_SPREADSHEET_ID
     else:
         raise ValueError(f"Невідоме джерело: {source}")
 
@@ -442,8 +444,7 @@ def sync_deliveries_from_sheets() -> dict:
         logger.error(f"Синхронізація FM: {e}", exc_info=True)
         result["errors"].append(f"FM: {e}")
 
-    from config import EKOL_SPREADSHEET_ID
-    if EKOL_SPREADSHEET_ID:
+    if config.EKOL_SPREADSHEET_ID:
         try:
             all_values_ekol, _ = get_sheet_data(source="ekol")
             points = extract_ekol_points(all_values_ekol)
@@ -482,6 +483,7 @@ def format_delivery_card(d: dict) -> str:
         lines.append(f"⏱ Годин оплати: {format_hours(d['hours'])}")
     if d.get("driver_phone"):
         lines.append(f"📞 {d['driver_phone']}")
+    lines.append(f"{src_emoji} {'FM' if d['source'] == 'fm' else 'Ekol'}")
 
     return "\n".join(lines)
 

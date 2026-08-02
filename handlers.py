@@ -929,7 +929,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     db.db_update_worker(existing_id, field, val)
             w = db.db_get_worker(existing_id)
             if not w.get("telegram_id"):
-                conn = get_conn()
+                conn = db.get_conn()
                 conn.execute("UPDATE workers SET telegram_id = ? WHERE id = ?", (telegram_id, existing_id))
                 conn.commit()
                 conn.close()
