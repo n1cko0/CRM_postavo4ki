@@ -908,3 +908,36 @@ def format_stats_message(report_date: str, stats: dict) -> str:
                     lines.append(f"    • {entry['label']} — {sign}{format_money(entry['profit'])} грн")
 
     return "\n".join(lines)
+
+
+def build_income_summary() -> str:
+    """Одним повідомленням: скільки логісти винні по кожній збереженій даті + разом.
+    Оформлено моноширинним блоком, щоб суми вирівнювались у стовпчик."""
+    dates = db.db_list_report_dates()
+    if not dates:
+        return "❌ Поки немає жодного звіту."
+
+    dates_sorted = sorted(dates, key=lambda d: datetime.strptime(d, "%d.%m.%Y"))
+
+    rows = []
+    total = 0.0
+    for d in dates_sorted:
+        _, stats = build_report_and_stats(d)
+        if not stats:
+            continue
+        income = stats.get("total_income", 0.0)
+        total += income
+        rows.append((d, income))
+
+    if not rows:
+        return "❌ Поки немає жодного звіту з даними."
+
+    amount_strs = [format_money(income) for _, income in rows]
+    width = max(len(s) for s in amount_strs)
+
+    lines2 = [f"{d}   {amt.rjust(width)} грн" for (d, _), amt in zip(rows, amount_strs)]
+    lines2.append("─" * (13 + width + 4))
+    lines2.append(f"Разом:      {format_money(total).rjust(width)} грн")
+
+    body = "\n".join(lines2)
+    return f"💰 *Скільки винні логісти по днях:*\n```\n{body}\n```"

@@ -554,6 +554,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = "Нові заявки (ще не в реєстрі):" if candidates else "❌ Поки немає нових заявок."
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
+    elif text == "💰 Борги логістів":
+        await update.message.reply_text(parsing.build_income_summary(), parse_mode="Markdown")
+
 
 # ==================== CALLBACK HANDLER ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
